@@ -29,14 +29,17 @@ tu = index.parse(None, sys.argv[1:], [], 13)
 def get_type(type):
     pointer = type.kind == cindex.TypeKind.POINTER
     typename = ""
-    if type.kind == cindex.TypeKind.TYPEDEF:
+    ref = type.kind == cindex.TypeKind.LVALUEREFERENCE
+    if type.kind == cindex.TypeKind.TYPEDEF or type.kind == cindex.TypeKind.RECORD:
         typename = type.get_declaration().spelling
-    elif pointer:
+    elif pointer or ref:
         typename = type.get_pointee().get_declaration().spelling
     else:
         typename = type.kind.name.lower()
+    if typename == None:
+        raise Exception("Typename was None")
 
-    return "%s%s" % (typename, "*" if pointer else "")
+    return "%s%s" % (typename, "@" if pointer else "&" if ref else "")
 
 def is_int(literal):
     try:
@@ -64,7 +67,7 @@ def get_function_def(cursor):
     return (get_type(cursor.result_type), cursor.spelling, args)
 
 def _assert(line):
-    return "r = %-128ls assert(r >= asSUCCESS);" % line
+    return "r = %-128ls assert(r >= asSUCCESS);\n" % line
 
 typedef = {}
 
@@ -73,15 +76,30 @@ def get_real_type(name):
         name = typedef[name]
     return name
 
+typedefs      = ""
+enums         = ""
+objecttypes   = ""
+functions     = ""
+objectmembers = ""
+
+
 def walk(cursor):
+    global typedefs
+    global enums
+    global objecttypes
+    global functions
+    global objectmembers
     for child in cursor.get_children():
         if child.kind == cindex.CursorKind.MACRO_DEFINITION:
             tokens = cindex.tokenize(tu, child.extent)
             if tokens[0].kind == cindex.TokenKind.IDENTIFIER and tokens[1].kind == cindex.TokenKind.LITERAL and is_int(tokens[1].spelling):
-                print _assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling))
+                enums += _assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling))
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
-           decl = get_function_def(child)
-           print _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" % (decl[0], decl[1], decl[2], decl[1], decl[2], decl[0]))
+            try:
+                decl = get_function_def(child)
+                functions += _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" % (decl[0], decl[1], decl[2], decl[1], decl[2], decl[0]))
+            except Exception as e:
+                print "Warning: skipping function %s - %s" % (child.spelling, e)
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
             tokens = cindex.tokenize(tu, child.extent)
             good = True
@@ -96,17 +114,54 @@ def walk(cursor):
                 kind = " ".join([t.spelling for t in tokens[1:len(tokens)-2]])
                 name = tokens[len(tokens)-2].spelling
                 typedef[name] = kind
-                print _assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind)))
+                typedefs += _assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind)))
             else:
                 data = ""
                 for token in tokens:
                     data += token.spelling + " "
-                sys.stderr.write("Warning, typedef too complex, ignoring: %s\n" % data)
-
+                sys.stderr.write("Warning, typedef too complex, skipping: %s\n" % data)
+        elif child.kind == cindex.CursorKind.CLASS_DECL:
+            children = child.get_children()
+            if len(children) == 0:
+                continue
+            access = cindex._cxx_access_specifiers[cindex.CXXAccessSpecifier.PRIVATE]
+            classname = child.spelling
+            data = ""
+            flags = {"asOBJ_APP_CLASS": True}
+            for child in children:
+                if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
+                    access = child.get_cxx_access_specifier()
+                    continue
+                if not access.is_public():
+                    continue
+                if child.kind == cindex.CursorKind.CXX_METHOD:
+                    if child.spelling == "operator=":
+                        flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
+                    try:
+                        decl = get_function_def(child)
+                        objectmembers += _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" % (classname, decl[0], decl[1], decl[2], classname, decl[1], decl[2], decl[0]))
+                    except Exception as e:
+                        print "Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e)
+                elif child.kind == cindex.CursorKind.CONSTRUCTOR:
+                    flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
+                elif child.kind == cindex.CursorKind.DESTRUCTOR:
+                    flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
+            finalflags = "todo"
+            finalsize = "todo"
+            objecttypes += _assert("engine->RegisterObjectType(\"%s\", %s, %s);" % (classname, finalflags, finalsize))
         else:
-            sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
+            pass
+            #sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
 
 walk(tu.cursor)
+
+f = open("generated.cpp", "w")
+f.write(typedefs)
+f.write(enums)
+f.write(objecttypes)
+f.write(functions)
+f.write(objectmembers)
+f.close()
 
 for diag in tu.diagnostics:
     sys.stderr.write("Warning, clang had the following to say: %s\n" % (diag.spelling))
