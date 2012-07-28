@@ -20,6 +20,7 @@
 #    distribution.
 from clang import cindex
 import sys
+import re
 
 index = cindex.Index.create()
 
@@ -54,6 +55,37 @@ def is_int(literal):
             pass
         return False
 
+objecttype_scoreboard = {}
+
+def add_use(typename):
+    val = (0, 0)
+    p = 0
+    if "@" in typename:
+        p = 1
+        typename = typename[:-1]
+
+    if typename in objecttype_scoreboard:
+        val = objecttype_scoreboard[typename]
+    objecttype_scoreboard[typename] = (val[0]+p, val[1]+1-p)
+
+typedef = {}
+
+def get_real_type(name):
+    ptr = "@" in name
+    if ptr:
+        name = name[:-1]
+    while name in typedef:
+        name = typedef[name]
+
+    if ptr:
+        return name + "@"
+    return name
+
+def get_as_type(name):
+    if name == "char@" or name == "unsigned char@":
+        return "string"
+    return name
+
 
 def get_function_def(cursor):
     args = ""
@@ -61,20 +93,18 @@ def get_function_def(cursor):
         if child.kind == cindex.CursorKind.PARM_DECL:
             if len(args):
                 args += ", "
-            args += get_type(child.type)
+            typename = get_real_type(get_type(child.type))
+            args += typename
+            add_use(typename)
 
+    restype = get_real_type(get_type(cursor.result_type))
+    add_use(restype)
+    return (restype, cursor.spelling, args)
 
-    return (get_type(cursor.result_type), cursor.spelling, args)
 
 def _assert(line):
     return "r = %-128ls assert(r >= asSUCCESS);\n" % line
 
-typedef = {}
-
-def get_real_type(name):
-    while name in typedef:
-        name = typedef[name]
-    return name
 
 typedefs      = ""
 enums         = ""
@@ -97,7 +127,7 @@ def walk(cursor):
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
                 decl = get_function_def(child)
-                functions += _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" % (decl[0], decl[1], decl[2], decl[1], decl[2], decl[0]))
+                functions += _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" % (decl[0], decl[1], decl[2], decl[1], decl[2].replace("@", "*"), decl[0]))
             except Exception as e:
                 print "Warning: skipping function %s - %s" % (child.spelling, e)
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
@@ -119,7 +149,7 @@ def walk(cursor):
                 data = ""
                 for token in tokens:
                     data += token.spelling + " "
-                sys.stderr.write("Warning, typedef too complex, skipping: %s\n" % data)
+                print "Warning, typedef too complex, skipping: %s" % data
         elif child.kind == cindex.CursorKind.CLASS_DECL:
             children = child.get_children()
             if len(children) == 0:
@@ -139,21 +169,57 @@ def walk(cursor):
                         flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
                     try:
                         decl = get_function_def(child)
-                        objectmembers += _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" % (classname, decl[0], decl[1], decl[2], classname, decl[1], decl[2], decl[0]))
+                        objectmembers += _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" % (classname, decl[0], decl[1], decl[2], classname, decl[1], decl[2].replace("@", "*"), decl[0]))
                     except Exception as e:
                         print "Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e)
                 elif child.kind == cindex.CursorKind.CONSTRUCTOR:
                     flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
                 elif child.kind == cindex.CursorKind.DESTRUCTOR:
                     flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
-            finalflags = "todo"
-            finalsize = "todo"
+            finalflags = "todo1"
+            finalsize = "todo2"
             objecttypes += _assert("engine->RegisterObjectType(\"%s\", %s, %s);" % (classname, finalflags, finalsize))
         else:
             pass
             #sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
 
+
 walk(tu.cursor)
+
+# File processed, do some post processing
+for key in objecttype_scoreboard:
+    ref, val = objecttype_scoreboard[key]
+    if ref == 0 or val == 0:
+        continue
+    print "Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val)
+    regex = r"(\"|,\s|\(|$)%s%s(\)|,)" % (re.escape(key), "@" if val > ref else "")
+    regex = re.compile(regex)
+
+    innerre = re.compile(r"\"((.+\s)?([\w@]+\s+\w+\([^\)]*\)))\"")
+    toadd = functions.split("\n")[:-1]
+    functions = []
+    while len(toadd):
+        line = toadd.pop(0)
+        if regex.search(line):
+            print "\t%s" % innerre.search(line).group(1)
+        else:
+            functions.append(line)
+    functions = "\n".join(functions)
+
+    innerre = re.compile(r"\"(\w+)\", \"((.+\s)?[\w@]+)\s+(\w+\([^\)]*\))\"")
+    toadd = objectmembers.split("\n")[:-1]
+    objectmembers = []
+    while len(toadd):
+        line = toadd.pop(0)
+        if regex.search(line):
+            inner = innerre.search(line)
+            print "\t%s %s::%s" % (inner.group(2), inner.group(1), inner.group(4))
+        else:
+            objectmembers.append(line)
+    objectmembers = "\n".join(objectmembers)
+    #if ref > val:
+    #    re.compile(r"^.*(\s|\()%s(\s|,|\)$)"
+
 
 f = open("generated.cpp", "w")
 f.write(typedefs)
@@ -164,4 +230,4 @@ f.write(objectmembers)
 f.close()
 
 for diag in tu.diagnostics:
-    sys.stderr.write("Warning, clang had the following to say: %s\n" % (diag.spelling))
+    print "Warning, clang had the following to say: %s" % (diag.spelling)
