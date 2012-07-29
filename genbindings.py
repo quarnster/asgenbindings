@@ -22,10 +22,59 @@ from clang import cindex
 import sys
 import re
 
+
+output_filename = None
+verbose = False
+fir = None
+fer = None
+funcname = "RegisterMyTypes"
+doassert = True
+i = 1
+clang_args = []
+while i < len(sys.argv):
+    if sys.argv[i] == "-o":
+        i += 1
+        output_filename = sys.argv[i]
+    elif sys.argv[i] == "-v":
+        verbose = True
+    elif sys.argv[i] == "-fir":
+        i += 1
+        fir = re.compile(sys.argv[i])
+    elif sys.argv[i] == "-fer":
+        i += 1
+        fer = re.compile(sys.argv[i])
+    elif sys.argv[i] == "-noassert":
+        doassert = False
+    elif sys.argv[i] == "-f":
+        i += 1
+        funcname = sys.argv[i]
+    else:
+        clang_args.append(sys.argv[i])
+    i += 1
+
+if output_filename == None:
+    print """usage: %s -o <output-filename> <options to use with clang>
+      -o        <filename> Specify which file to save output to"
+      -v                   Enable verbose warning output
+      -fir      <pattern>  File Inclusion Regex. Only cursors coming from file names matching the regex pattern will be added.
+      -fer      <pattern>  File Exclusion regex. Cursors for which the filename matches the regex pattern will be excluded.
+      -noassert            Don't do the assert check when registering
+      -f        <name>     Name of the generated function
+
+    Any unknown parameters will be forwarded to clang""" % (sys.argv[0])
+    sys.exit(1)
+
 index = cindex.Index.create()
 
-tu = index.parse(None, sys.argv[1:], [], 13)
+tu = index.parse(None, clang_args, [], 13)
 
+
+warn_count = 0
+def warn(msg):
+    global warn_count
+    warn_count += 1
+    if verbose:
+        print msg
 
 def get_type(type):
     pointer = type.kind == cindex.TypeKind.POINTER
@@ -82,16 +131,26 @@ def get_real_type(name):
     return name
 
 def get_as_type(name):
+    name = name.replace("*", "@")
     if name == "char@" or name == "unsigned char@":
         return "string"
     return name
 
 
 class Function:
-    def __init__(self, name, args, return_type, clazz=None):
-        self.name = name
+    def __init__(self, cursor, clazz=None):
+        args = []
+        for child in cursor.get_children():
+            if child.kind == cindex.CursorKind.PARM_DECL:
+                typename = get_real_type(get_type(child.type))
+                args.append(typename)
+                add_use(typename)
+
+        restype = get_real_type(get_type(cursor.result_type))
+        add_use(restype)
+        self.name = cursor.spelling
         self.args = args
-        self.return_type = return_type
+        self.return_type = restype
         self.clazz = clazz
 
     def uses(self, typename):
@@ -127,7 +186,7 @@ class ObjectType:
             score = objecttype_scoreboard[self.name]
             value_type = score[0] < score[1]
         else:
-            print "Warning: No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference")
+            warn("Warning: No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference"))
         if value_type:
             f = "|".join(self.flags)
             f = "asOBJ_VALUE|%s" % f
@@ -151,30 +210,40 @@ class ObjectField:
         return _assert("engine->RegisterObjectProperty(\"%s\", \"%s %s\", asOFFSET(%s,%s));" % (self.clazz, self.type, self.name, self.clazz, self.name))
 
 
-typedefs      = ""
-enums         = ""
+typedefs      = []
+enums         = []
 objecttypes   = []
 functions     = []
 objectmethods = []
 objectfields  = []
 
-def get_function_def(cursor, clazz=None):
-    args = []
-    for child in cursor.get_children():
-        if child.kind == cindex.CursorKind.PARM_DECL:
-            typename = get_real_type(get_type(child.type))
-            args.append(typename)
-            add_use(typename)
-
-    restype = get_real_type(get_type(cursor.result_type))
-    add_use(restype)
-    f = Function(cursor.spelling, args, restype, clazz)
-    return f
-
 
 def _assert(line):
-    return "r = %-128ls assert(r >= asSUCCESS);" % line
+    if doassert:
+        return "r = %-128ls assert(r >= asSUCCESS);" % line
+    else:
+        return line
 
+
+def get_typedef(cursor):
+    tokens = cindex.tokenize(tu, cursor.extent)
+    good = True
+    if len(tokens) >= 4:
+        for x in tokens[1:-2]:
+            if x.kind != cindex.TokenKind.IDENTIFIER and x.kind != cindex.TokenKind.KEYWORD:
+                good = False
+                break
+    else:
+        good = False
+    if good:
+        kind = " ".join([t.spelling for t in tokens[1:len(tokens)-2]])
+        name = tokens[len(tokens)-2].spelling
+    else:
+        data = ""
+        for token in tokens:
+            data += token.spelling + " "
+        return None, data
+    return name, kind
 
 def walk(cursor):
     global typedefs
@@ -183,35 +252,29 @@ def walk(cursor):
     global functions
     global objectmethods
     for child in cursor.get_children():
+        if not child.location.file:
+            continue
+        filename = child.location.file.name
+        if fer and fer.search(filename):
+            continue
+        if fir and not fir.search(filename):
+            continue
         if child.kind == cindex.CursorKind.MACRO_DEFINITION:
             tokens = cindex.tokenize(tu, child.extent)
             if tokens[0].kind == cindex.TokenKind.IDENTIFIER and tokens[1].kind == cindex.TokenKind.LITERAL and is_int(tokens[1].spelling):
-                enums += _assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling))
+                enums.append(_assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling)))
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
-                functions.append(get_function_def(child))
+                functions.append(Function(child))
             except Exception as e:
-                print "Warning: skipping function %s - %s" % (child.spelling, e)
+                warn("Warning: skipping function %s - %s" % (child.spelling, e))
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
-            tokens = cindex.tokenize(tu, child.extent)
-            good = True
-            if len(tokens) >= 4:
-                for x in tokens[1:-2]:
-                    if x.kind != cindex.TokenKind.IDENTIFIER and x.kind != cindex.TokenKind.KEYWORD:
-                        good = False
-                        break
-            else:
-                good = False
-            if good:
-                kind = " ".join([t.spelling for t in tokens[1:len(tokens)-2]])
-                name = tokens[len(tokens)-2].spelling
+            name, kind = get_typedef(child)
+            if name:
                 typedef[name] = kind
-                typedefs += _assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind)))
+                typedefs.append(_assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind))))
             else:
-                data = ""
-                for token in tokens:
-                    data += token.spelling + " "
-                print "Warning, typedef too complex, skipping: %s" % data
+                warn("Warning, typedef too complex, skipping: %s" % name)
         elif child.kind == cindex.CursorKind.CLASS_DECL or child.kind == cindex.CursorKind.STRUCT_DECL:
             children = child.get_children()
             if len(children) == 0:
@@ -231,9 +294,9 @@ def walk(cursor):
                     if child.spelling == "operator=":
                         o.flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
                     try:
-                        objectmethods.append(get_function_def(child, classname))
+                        objectmethods.append(Function(child, classname))
                     except Exception as e:
-                        print "Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e)
+                        warn("Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.CONSTRUCTOR:
                     o.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
                 elif child.kind == cindex.CursorKind.DESTRUCTOR:
@@ -244,13 +307,22 @@ def walk(cursor):
                         add_use(type)
                         objectfields.append(ObjectField(classname, child.spelling, type))
                     except Exception as e:
-                        print "Warning: skipping member field %s::%s - %s" % (classname, child.spelling, e)
+                        warn("Warning: skipping member field %s::%s - %s" % (classname, child.spelling, e))
+                elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
+                    name, kind = get_typedef(child)
+                    if name:
+                        typedef[name] = kind
+                    warn("Typedefs within classes is not supported by AngelScript")
                 else:
-                    sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
+                    warn("Warning, unhandled cursor: %s, %s" % (child.displayname, child.kind))
             objecttypes.append(o)
+        elif child.kind == cindex.CursorKind.MACRO_INSTANTIATION or \
+                child.kind == cindex.CursorKind.CONVERSION_FUNCTION or \
+                 child.kind == cindex.CursorKind.INCLUSION_DIRECTIVE or \
+                 child.kind == cindex.CursorKind.UNEXPOSED_DECL:
+            continue
         else:
-            pass
-            #sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
+            warn("Warning, unhandled cursor: %s, %s" % (child.displayname, child.kind))
 
 
 
@@ -265,7 +337,7 @@ def remove_ref_val_mismatches():
         ref, val = objecttype_scoreboard[key]
         if ref == 0 or val == 0:
             continue
-        print "Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val)
+        warn("Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val))
         toremove = "%s%s" % (key, "*" if val > ref else "")
 
         toadd = functions
@@ -273,7 +345,7 @@ def remove_ref_val_mismatches():
         while len(toadd):
             curr = toadd.pop(0)
             if curr.uses(toremove):
-                print "\t%s" % curr.pretty_name()
+                warn("\t%s" % curr.pretty_name())
             else:
                 functions.append(curr)
 
@@ -282,7 +354,7 @@ def remove_ref_val_mismatches():
         while len(toadd):
             curr = toadd.pop(0)
             if curr.uses(toremove):
-                print "\t%s" % curr.pretty_name()
+                warn("\t%s" % curr.pretty_name())
             else:
                 objectmethods.append(curr)
 
@@ -292,14 +364,24 @@ walk(tu.cursor)
 remove_ref_val_mismatches()
 
 
-f = open("generated.cpp", "w")
-f.write(typedefs)
-f.write(enums)
-f.write("\n".join([o.get_register_string() for o in objecttypes]))
-f.write("\n".join([o.get_register_string() for o in functions]))
-f.write("\n".join([o.get_register_string() for o in objectmethods]))
-f.write("\n".join([o.get_register_string() for o in objectfields]))
+f = open(output_filename, "w")
+f.write("#include <angelscript.h>\n\n")
+f.write("void %s(asIScriptEngine* engine)\n{\n\t" % funcname)
+f.write("\n\t".join(typedefs))
+f.write("\n\t")
+f.write("\n\t".join(enums))
+f.write("\n\t")
+f.write("\n\t".join([o.get_register_string() for o in objecttypes]))
+f.write("\n\t")
+f.write("\n\t".join([o.get_register_string() for o in functions]))
+f.write("\n\t")
+f.write("\n\t".join([o.get_register_string() for o in objectmethods]))
+f.write("\n\t")
+f.write("\n\t".join([o.get_register_string() for o in objectfields]))
+f.write("\n}\n")
 f.close()
 
 for diag in tu.diagnostics:
-    print "Warning, clang had the following to say: %s" % (diag.spelling)
+    warn("Warning, clang had the following to say: %s" % (diag.spelling))
+
+print "Finished with %d warnings" % warn_count
