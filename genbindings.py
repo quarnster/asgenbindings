@@ -184,41 +184,50 @@ def walk(cursor):
             #sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
 
 
+
+# Removes usage of object types that are used both as a reference and a value type
+def remove_ref_val_mismatches():
+    global typedefs
+    global enums
+    global objecttypes
+    global functions
+    global objectmembers
+    for key in objecttype_scoreboard:
+        ref, val = objecttype_scoreboard[key]
+        if ref == 0 or val == 0:
+            continue
+        print "Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val)
+        regex = r"(\"|,\s|\(|$)%s%s(\)|,)" % (re.escape(key), "@" if val > ref else "")
+        regex = re.compile(regex)
+
+        innerre = re.compile(r"\"((.+\s)?([\w@]+\s+\w+\([^\)]*\)))\"")
+        toadd = functions.split("\n")[:-1]
+        functions = []
+        while len(toadd):
+            line = toadd.pop(0)
+            if regex.search(line):
+                print "\t%s" % innerre.search(line).group(1)
+            else:
+                functions.append(line)
+        functions = "\n".join(functions)
+
+        innerre = re.compile(r"\"(\w+)\", \"((.+\s)?[\w@]+)\s+(\w+\([^\)]*\))\"")
+        toadd = objectmembers.split("\n")[:-1]
+        objectmembers = []
+        while len(toadd):
+            line = toadd.pop(0)
+            if regex.search(line):
+                inner = innerre.search(line)
+                print "\t%s %s::%s" % (inner.group(2), inner.group(1), inner.group(4))
+            else:
+                objectmembers.append(line)
+        objectmembers = "\n".join(objectmembers)
+
+
 walk(tu.cursor)
 
 # File processed, do some post processing
-for key in objecttype_scoreboard:
-    ref, val = objecttype_scoreboard[key]
-    if ref == 0 or val == 0:
-        continue
-    print "Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val)
-    regex = r"(\"|,\s|\(|$)%s%s(\)|,)" % (re.escape(key), "@" if val > ref else "")
-    regex = re.compile(regex)
-
-    innerre = re.compile(r"\"((.+\s)?([\w@]+\s+\w+\([^\)]*\)))\"")
-    toadd = functions.split("\n")[:-1]
-    functions = []
-    while len(toadd):
-        line = toadd.pop(0)
-        if regex.search(line):
-            print "\t%s" % innerre.search(line).group(1)
-        else:
-            functions.append(line)
-    functions = "\n".join(functions)
-
-    innerre = re.compile(r"\"(\w+)\", \"((.+\s)?[\w@]+)\s+(\w+\([^\)]*\))\"")
-    toadd = objectmembers.split("\n")[:-1]
-    objectmembers = []
-    while len(toadd):
-        line = toadd.pop(0)
-        if regex.search(line):
-            inner = innerre.search(line)
-            print "\t%s %s::%s" % (inner.group(2), inner.group(1), inner.group(4))
-        else:
-            objectmembers.append(line)
-    objectmembers = "\n".join(objectmembers)
-    #if ref > val:
-    #    re.compile(r"^.*(\s|\()%s(\s|,|\)$)"
+remove_ref_val_mismatches()
 
 
 f = open("generated.cpp", "w")
