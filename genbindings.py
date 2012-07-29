@@ -40,7 +40,7 @@ def get_type(type):
     if typename == None:
         raise Exception("Typename was None")
 
-    return "%s%s" % (typename, "@" if pointer else "&" if ref else "")
+    return "%s%s" % (typename, "*" if pointer else "&" if ref else "")
 
 def is_int(literal):
     try:
@@ -60,7 +60,7 @@ objecttype_scoreboard = {}
 def add_use(typename):
     val = (0, 0)
     p = 0
-    if "@" in typename:
+    if "*" in typename:
         p = 1
         typename = typename[:-1]
 
@@ -71,14 +71,14 @@ def add_use(typename):
 typedef = {}
 
 def get_real_type(name):
-    ptr = "@" in name
+    ptr = "*" in name
     if ptr:
         name = name[:-1]
     while name in typedef:
         name = typedef[name]
 
     if ptr:
-        return name + "@"
+        return name + "*"
     return name
 
 def get_as_type(name):
@@ -87,30 +87,93 @@ def get_as_type(name):
     return name
 
 
-def get_function_def(cursor):
-    args = ""
-    for child in cursor.get_children():
-        if child.kind == cindex.CursorKind.PARM_DECL:
-            if len(args):
-                args += ", "
-            typename = get_real_type(get_type(child.type))
-            args += typename
-            add_use(typename)
+class Function:
+    def __init__(self, name, args, return_type, clazz=None):
+        self.name = name
+        self.args = args
+        self.return_type = return_type
+        self.clazz = clazz
 
-    restype = get_real_type(get_type(cursor.result_type))
-    add_use(restype)
-    return (restype, cursor.spelling, args)
+    def uses(self, typename):
+        return self.return_type == typename or typename in self.args
+
+    def pretty_name(self):
+        cargs =  ", ".join(self.args)
+        if self.clazz:
+            return "%s %s::%s(%s)" % (self.return_type, self.clazz, self.name, cargs)
+        else:
+            return "%s %s(%s)" % (self.return_type, self.name, cargs)
+
+    def get_register_string(self):
+        asargs = ", ".join([get_as_type(at) for at in self.args])
+        cargs =  ", ".join(self.args)
+        if self.clazz == None:
+            return _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" %
+                        (get_as_type(self.return_type), self.name, self.args,
+                         self.name, cargs, self.return_type))
+        else:
+            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" %
+                (self.clazz, get_as_type(self.return_type), self.name, asargs, self.clazz, self.name, cargs, self.return_type))
 
 
-def _assert(line):
-    return "r = %-128ls assert(r >= asSUCCESS);\n" % line
+class ObjectType:
+    def __init__(self, name):
+        self.name = name
+        self.flags = {"asOBJ_APP_CLASS": True}
+
+    def get_register_string(self):
+        value_type = True
+        if self.name in objecttype_scoreboard:
+            score = objecttype_scoreboard[self.name]
+            value_type = score[0] < score[1]
+        else:
+            print "Warning: No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference")
+        if value_type:
+            f = "|".join(self.flags)
+            f = "asOBJ_VALUE|%s" % f
+            return _assert("engine->RegisterObjectType(\"%s\", sizeof(%s), %s);" % (self.name, self.name, f))
+        else:
+            return _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name))
+
+class ObjectField:
+    def __init__(self, clazz, name, type):
+        self.clazz = clazz
+        self.name = name
+        self.type = type
+
+    def uses(self, typename):
+        return self.type == typename
+
+    def pretty_name(self):
+        return "%s %s::%s" % (self.type, self.clazz, self.name)
+
+    def get_register_string(self):
+        return _assert("engine->RegisterObjectProperty(\"%s\", \"%s %s\", asOFFSET(%s,%s));" % (self.clazz, self.type, self.name, self.clazz, self.name))
 
 
 typedefs      = ""
 enums         = ""
-objecttypes   = ""
-functions     = ""
-objectmembers = ""
+objecttypes   = []
+functions     = []
+objectmethods = []
+objectfields  = []
+
+def get_function_def(cursor, clazz=None):
+    args = []
+    for child in cursor.get_children():
+        if child.kind == cindex.CursorKind.PARM_DECL:
+            typename = get_real_type(get_type(child.type))
+            args.append(typename)
+            add_use(typename)
+
+    restype = get_real_type(get_type(cursor.result_type))
+    add_use(restype)
+    f = Function(cursor.spelling, args, restype, clazz)
+    return f
+
+
+def _assert(line):
+    return "r = %-128ls assert(r >= asSUCCESS);" % line
 
 
 def walk(cursor):
@@ -118,7 +181,7 @@ def walk(cursor):
     global enums
     global objecttypes
     global functions
-    global objectmembers
+    global objectmethods
     for child in cursor.get_children():
         if child.kind == cindex.CursorKind.MACRO_DEFINITION:
             tokens = cindex.tokenize(tu, child.extent)
@@ -126,8 +189,7 @@ def walk(cursor):
                 enums += _assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling))
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
-                decl = get_function_def(child)
-                functions += _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" % (decl[0], decl[1], decl[2], decl[1], decl[2].replace("@", "*"), decl[0]))
+                functions.append(get_function_def(child))
             except Exception as e:
                 print "Warning: skipping function %s - %s" % (child.spelling, e)
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
@@ -150,14 +212,15 @@ def walk(cursor):
                 for token in tokens:
                     data += token.spelling + " "
                 print "Warning, typedef too complex, skipping: %s" % data
-        elif child.kind == cindex.CursorKind.CLASS_DECL:
+        elif child.kind == cindex.CursorKind.CLASS_DECL or child.kind == cindex.CursorKind.STRUCT_DECL:
             children = child.get_children()
             if len(children) == 0:
                 continue
+
+            idx = cindex.CXXAccessSpecifier.PRIVATE if child.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
             access = cindex._cxx_access_specifiers[cindex.CXXAccessSpecifier.PRIVATE]
             classname = child.spelling
-            data = ""
-            flags = {"asOBJ_APP_CLASS": True}
+            o = ObjectType(classname)
             for child in children:
                 if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
                     access = child.get_cxx_access_specifier()
@@ -166,19 +229,25 @@ def walk(cursor):
                     continue
                 if child.kind == cindex.CursorKind.CXX_METHOD:
                     if child.spelling == "operator=":
-                        flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
+                        o.flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
                     try:
-                        decl = get_function_def(child)
-                        objectmembers += _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" % (classname, decl[0], decl[1], decl[2], classname, decl[1], decl[2].replace("@", "*"), decl[0]))
+                        objectmethods.append(get_function_def(child, classname))
                     except Exception as e:
                         print "Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e)
                 elif child.kind == cindex.CursorKind.CONSTRUCTOR:
-                    flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
+                    o.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
                 elif child.kind == cindex.CursorKind.DESTRUCTOR:
-                    flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
-            finalflags = "todo1"
-            finalsize = "todo2"
-            objecttypes += _assert("engine->RegisterObjectType(\"%s\", %s, %s);" % (classname, finalflags, finalsize))
+                    o.flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
+                elif child.kind == cindex.CursorKind.FIELD_DECL:
+                    try:
+                        type = get_real_type(get_type(child.type))
+                        add_use(type)
+                        objectfields.append(ObjectField(classname, child.spelling, type))
+                    except Exception as e:
+                        print "Warning: skipping member field %s::%s - %s" % (classname, child.spelling, e)
+                else:
+                    sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
+            objecttypes.append(o)
         else:
             pass
             #sys.stderr.write("Warning, unhandled cursor: %s, %s\n" % (child.displayname, child.kind))
@@ -191,38 +260,31 @@ def remove_ref_val_mismatches():
     global enums
     global objecttypes
     global functions
-    global objectmembers
+    global objectmethods
     for key in objecttype_scoreboard:
         ref, val = objecttype_scoreboard[key]
         if ref == 0 or val == 0:
             continue
         print "Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val)
-        regex = r"(\"|,\s|\(|$)%s%s(\)|,)" % (re.escape(key), "@" if val > ref else "")
-        regex = re.compile(regex)
+        toremove = "%s%s" % (key, "*" if val > ref else "")
 
-        innerre = re.compile(r"\"((.+\s)?([\w@]+\s+\w+\([^\)]*\)))\"")
-        toadd = functions.split("\n")[:-1]
+        toadd = functions
         functions = []
         while len(toadd):
-            line = toadd.pop(0)
-            if regex.search(line):
-                print "\t%s" % innerre.search(line).group(1)
+            curr = toadd.pop(0)
+            if curr.uses(toremove):
+                print "\t%s" % curr.pretty_name()
             else:
-                functions.append(line)
-        functions = "\n".join(functions)
+                functions.append(curr)
 
-        innerre = re.compile(r"\"(\w+)\", \"((.+\s)?[\w@]+)\s+(\w+\([^\)]*\))\"")
-        toadd = objectmembers.split("\n")[:-1]
-        objectmembers = []
+        toadd = objectmethods
+        objectmethods = []
         while len(toadd):
-            line = toadd.pop(0)
-            if regex.search(line):
-                inner = innerre.search(line)
-                print "\t%s %s::%s" % (inner.group(2), inner.group(1), inner.group(4))
+            curr = toadd.pop(0)
+            if curr.uses(toremove):
+                print "\t%s" % curr.pretty_name()
             else:
-                objectmembers.append(line)
-        objectmembers = "\n".join(objectmembers)
-
+                objectmethods.append(curr)
 
 walk(tu.cursor)
 
@@ -233,9 +295,10 @@ remove_ref_val_mismatches()
 f = open("generated.cpp", "w")
 f.write(typedefs)
 f.write(enums)
-f.write(objecttypes)
-f.write(functions)
-f.write(objectmembers)
+f.write("\n".join([o.get_register_string() for o in objecttypes]))
+f.write("\n".join([o.get_register_string() for o in functions]))
+f.write("\n".join([o.get_register_string() for o in objectmethods]))
+f.write("\n".join([o.get_register_string() for o in objectfields]))
 f.close()
 
 for diag in tu.diagnostics:
