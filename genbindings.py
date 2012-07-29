@@ -80,14 +80,30 @@ def get_type(type):
     pointer = type.kind == cindex.TypeKind.POINTER
     typename = ""
     ref = type.kind == cindex.TypeKind.LVALUEREFERENCE
-    if type.kind == cindex.TypeKind.TYPEDEF or type.kind == cindex.TypeKind.RECORD:
-        typename = type.get_declaration().spelling
+    if type.kind == cindex.TypeKind.TYPEDEF or type.kind == cindex.TypeKind.RECORD or type.kind == cindex.TypeKind.ENUM:
+        typename = type.get_declaration()
     elif pointer or ref:
-        typename = type.get_pointee().get_declaration().spelling
+        typename = type.get_pointee().get_declaration()
+    elif type.kind == cindex.TypeKind.ULONG:
+        typename = "unsigned long"
+    elif type.kind == cindex.TypeKind.UINT:
+        typename = "unsigned int"
     else:
         typename = type.kind.name.lower()
-    if typename == None:
+    if typename is None:
         raise Exception("Typename was None")
+    elif isinstance(typename, cindex.Cursor):
+        if typename.spelling == None:
+            raise Exception("Typename was None")
+
+        fullname = [typename.spelling]
+        cursor = typename.get_lexical_parent()
+        while not cursor is None and (cursor.kind == cindex.CursorKind.NAMESPACE or cursor.kind == cindex.CursorKind.CLASS_DECL):
+            fullname.insert(0, cursor.displayname)
+            cursor = cursor.get_lexical_parent()
+        typename = "::".join(fullname)
+    elif typename == "unexposed":
+        raise Exception("Typename is unexposed")
 
     return "%s%s" % (typename, "*" if pointer else "&" if ref else "")
 
@@ -130,49 +146,106 @@ def get_real_type(name):
         return name + "*"
     return name
 
-def get_as_type(name):
-    name = name.replace("*", "@")
-    if name == "char@" or name == "unsigned char@":
-        return "string"
-    return name
+
+def is_const(cursor):
+    tokens = cindex.tokenize(tu, cursor.extent)
+    for token in tokens:
+        if token.spelling == "const":
+            return True
+    return False
+
+
+class Type:
+    def __init__(self, kind):
+        typename = get_type(kind)
+        self.cname = typename
+        typename = get_real_type(typename)
+        self.resolved = typename
+        add_use(typename)
+        self.const = kind.is_const_qualified()
+
+    def __repr__(self):
+        return self.cname
+
+    def get_as_type(self):
+        name = self.resolved.replace("*", "@")
+        if name == "char@" or name == "unsigned char@":
+            name = "string"
+        return "%s%s" % ("const " if self.const else "", name)
+
+    def get_c_type(self):
+        return "%s%s" % ("const " if self.const else "", self.cname)
 
 
 class Function:
     def __init__(self, cursor, clazz=None):
-        args = []
+        self.args = []
         for child in cursor.get_children():
             if child.kind == cindex.CursorKind.PARM_DECL:
-                typename = get_real_type(get_type(child.type))
-                args.append(typename)
-                add_use(typename)
+                t = Type(child.type)
+                t.const = is_const(child)
+                self.args.append(t)
 
-        restype = get_real_type(get_type(cursor.result_type))
-        add_use(restype)
         self.name = cursor.spelling
-        self.args = args
-        self.return_type = restype
+        self.return_type = Type(cursor.result_type)
         self.clazz = clazz
+        self.const = False
+
+        if self.clazz:
+            tokens = cindex.tokenize(tu, cursor.extent)
+            parcount = 0
+            startLooking = False
+            for i in range(len(tokens)-1):
+                token = tokens[i]
+
+                if token.spelling == "(":
+                    parcount += 1
+                elif token.spelling == ")":
+                    parcount -= 1
+                    if parcount == 0:
+                        startLooking = True
+
+                if not startLooking:
+                    continue
+
+                if token.spelling == ";" or token.spelling == "{":
+                    break
+                elif token.spelling == "const":
+                    self.const = True
+                    break
+            for token in tokens:
+                if token.kind != cindex.TokenKind.KEYWORD:
+                    break
+                if token.spelling == "const":
+                    self.return_type.const = True
+                    break
 
     def uses(self, typename):
-        return self.return_type == typename or typename in self.args
+        if self.return_type.resolved == typename:
+            return True
+        for t in self.args:
+            if t.resolved == typename:
+                return True
+        return False
 
     def pretty_name(self):
-        cargs =  ", ".join(self.args)
+        cargs =  ", ".join(self.cargs)
         if self.clazz:
             return "%s %s::%s(%s)" % (self.return_type, self.clazz, self.name, cargs)
         else:
             return "%s %s(%s)" % (self.return_type, self.name, cargs)
 
     def get_register_string(self):
-        asargs = ", ".join([get_as_type(at) for at in self.args])
-        cargs =  ", ".join(self.args)
+        asargs = ", ".join([at.get_as_type() for at in self.args])
+        cargs =  ", ".join([at.get_c_type()  for at in self.args])
         if self.clazz == None:
             return _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" %
-                        (get_as_type(self.return_type), self.name, self.args,
-                         self.name, cargs, self.return_type))
+                        (self.return_type.get_as_type(), self.name, asargs,
+                         self.name, cargs, self.return_type.get_c_type()))
         else:
-            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)\", asMETHODPR(%s, %s, (%s), %s), asCALL_THISCALL);" %
-                (self.clazz, get_as_type(self.return_type), self.name, asargs, self.clazz, self.name, cargs, self.return_type))
+            const = " const" if self.const else ""
+            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)%s\", asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL);" %
+                (self.clazz, self.return_type.get_as_type(), self.name, asargs, const, self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
 
 
 class ObjectType:
@@ -216,7 +289,7 @@ objecttypes   = []
 functions     = []
 objectmethods = []
 objectfields  = []
-
+includes      = []
 
 def _assert(line):
     if doassert:
@@ -245,6 +318,10 @@ def get_typedef(cursor):
         return None, data
     return name, kind
 
+def add_include(filename):
+    if not filename in includes and filename.endswith(".h"):
+        includes.append(filename)
+
 def walk(cursor):
     global typedefs
     global enums
@@ -266,6 +343,7 @@ def walk(cursor):
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
                 functions.append(Function(child))
+                add_include(filename)
             except Exception as e:
                 warn("Warning: skipping function %s - %s" % (child.spelling, e))
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
@@ -293,6 +371,9 @@ def walk(cursor):
                 if child.kind == cindex.CursorKind.CXX_METHOD:
                     if child.spelling == "operator=":
                         o.flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
+                    if child.get_cxxmethod_is_static():
+                        warn("Skipping member method %s::%s as it's static" % (classname, child.spelling))
+                        continue
                     try:
                         objectmethods.append(Function(child, classname))
                     except Exception as e:
@@ -316,6 +397,7 @@ def walk(cursor):
                 else:
                     warn("Warning, unhandled cursor: %s, %s" % (child.displayname, child.kind))
             objecttypes.append(o)
+            add_include(filename)
         elif child.kind == cindex.CursorKind.MACRO_INSTANTIATION or \
                 child.kind == cindex.CursorKind.CONVERSION_FUNCTION or \
                  child.kind == cindex.CursorKind.INCLUSION_DIRECTIVE or \
@@ -365,7 +447,9 @@ remove_ref_val_mismatches()
 
 
 f = open(output_filename, "w")
-f.write("#include <angelscript.h>\n\n")
+f.write("#include <angelscript.h>\n\n#include \"")
+f.write("\"\n#include \"".join(includes))
+f.write("\"\n\n\t")
 f.write("void %s(asIScriptEngine* engine)\n{\n\t" % funcname)
 f.write("\n\t".join(typedefs))
 f.write("\n\t")
