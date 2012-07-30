@@ -258,7 +258,7 @@ class Function:
                 f.close()
                 data = re.sub(r"%s.*" % self.name, "", data)
                 self.return_type.const = re.search(r"\s*const\s*$", data) != None
-
+        self.asname()
 
     def uses(self, typename):
         if self.return_type.resolved == typename:
@@ -275,6 +275,52 @@ class Function:
         else:
             return "%s %s(%s)" % (self.return_type, self.name, cargs)
 
+    def asname(self):
+        namedict = {
+            "-operator":       "opNeg",
+            "~operator":       "opCom",
+            "++operator":      "opPreInc",
+            "--operator":      "opPreDec",
+            "operator==":      "opEquals",
+            "operator!=":      "opEquals",
+            "operator<":       "opCmp",
+            "operator<=":      "opCmp",
+            "operator>":       "opCmp",
+            "operator>=":      "opCmp",
+            "operator++":      "opPostInc",
+            "operator--":      "opPostDec",
+            "operator+":       "opAdd",
+            "operator-":       "opSub",
+            "operator*":       "opMul",
+            "operator/":       "opDiv",
+            "operator%":       "opMod",
+            "operator&":       "opAnd",
+            "operator|":       "opOr",
+            "operator^":       "opXor",
+            "operator<<":      "opShl",
+            "operator>>":      "opShr",
+            "operator>>>":     "opUShr",
+            "operator[]":      "opIndex",
+            "operator=":       "opAssign",
+            "operator+=":      "opAddAssign",
+            "operator-=":      "opSubAssign",
+            "operator*=":      "opMulAssign",
+            "operator/=":      "opDivAssign",
+            "operator%=":      "opModAssign",
+            "operator&=":      "opAndAssign",
+            "operator|=":      "opOrAssign",
+            "operator^=":      "opXorAssign",
+            "operator<<=":     "opShlAssign",
+            "operator>>=":     "opShrAssign",
+            "operator>>>=":    "opUShrAssign",
+        }
+        name = self.name
+        if "operator" in name:
+            if name not in namedict:
+                raise Exception("Operator not supported in AngelScript %s" % self.pretty_name())
+            name = namedict[name]
+        return name
+
     def get_register_string(self):
         asargs = ", ".join([at.get_as_type() for at in self.args])
         cargs =  ", ".join([at.get_c_type()  for at in self.args])
@@ -285,7 +331,7 @@ class Function:
         else:
             const = " const" if self.const else ""
             return _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)%s\", asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL);" %
-                (self.clazz, self.return_type.get_as_type(), self.name, asargs, const, self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
+                (self.clazz, self.return_type.get_as_type(), self.asname(), asargs, const, self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
 
 
 class ObjectType:
