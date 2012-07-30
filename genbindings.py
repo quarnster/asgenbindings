@@ -29,6 +29,7 @@ fir = None
 fer = None
 funcname = "RegisterMyTypes"
 doassert = True
+keep_unknowns = False
 i = 1
 clang_args = []
 while i < len(sys.argv):
@@ -48,6 +49,8 @@ while i < len(sys.argv):
     elif sys.argv[i] == "-f":
         i += 1
         funcname = sys.argv[i]
+    elif sys.argv[i] == "-ku":
+        keep_unknowns = True
     else:
         clang_args.append(sys.argv[i])
     i += 1
@@ -60,6 +63,7 @@ if output_filename == None:
       -fer      <pattern>  File Exclusion regex. Cursors for which the filename matches the regex pattern will be excluded.
       -noassert            Don't do the assert check when registering
       -f        <name>     Name of the generated function
+      -ku                  Keep functions and members declared with an unknown type. Useful if that type is registered elsewhere.
 
     Any unknown parameters will be forwarded to clang""" % (sys.argv[0])
     sys.exit(1)
@@ -139,13 +143,16 @@ typedef = {}
 
 def get_real_type(name):
     ptr = "*" in name
-    if ptr:
+    ref = "&" in name
+    if ptr or ref:
         name = name[:-1]
     while name in typedef:
         name = typedef[name]
 
     if ptr:
         return name + "*"
+    if ref:
+        return name + "&"
     return name
 
 
@@ -156,6 +163,31 @@ def is_const(cursor):
             return True
     return False
 
+as_builtins = {
+    "unsigned long": "uint64",
+    "unsigned int": "uint",
+    "unsigned short": "uint16",
+    "unsigned char": "uint8",
+    "long": "int64",
+    "void": "void",
+    "double": "double",
+    "float": "float",
+    "char": "int8",
+    "short": "int16",
+    "int": "int",
+    "long": "int64",
+    "bool": "bool"
+    }
+def get_as_type(name):
+    ptr = "*" in name
+    ref = "&" in name
+    name = name.replace("*", "").replace("&", "")
+
+    if name in as_builtins:
+        if ptr:
+            raise Exception("Built-in value type %s used as a reference type" % (as_builtins[name]))
+        name = as_builtins[name]
+    return "%s%s%s" % (name, "@" if ptr else "", "&" if ref else "")
 
 class Type:
     def __init__(self, kind):
@@ -165,15 +197,13 @@ class Type:
         self.resolved = typename
         add_use(typename)
         self.const = kind.is_const_qualified()
+        get_as_type(self.resolved)
 
     def __repr__(self):
         return self.cname
 
     def get_as_type(self):
-        name = self.resolved.replace("*", "@")
-        if name == "char@" or name == "unsigned char@":
-            name = "string"
-        return "%s%s" % ("const " if self.const else "", name)
+        return "%s%s" % ("const " if self.const else "", get_as_type(self.resolved))
 
     def get_c_type(self):
         return "%s%s" % ("const " if self.const else "", self.cname)
@@ -195,7 +225,6 @@ class Function:
         self.const = False
 
         if self.clazz:
-
             start = cursor.extent.start
             end = cursor.extent.end
             i = 0
@@ -220,8 +249,6 @@ class Function:
             data = f.read(length)
             f.close()
             self.const = re.search(r"\s*const\s*(=\s*0)?$", data) != None
-            if self.name == "GetTransform":
-                print data
 
             if children[0].kind != cindex.CursorKind.PARM_DECL:
                 f = open(cursor.location.file.name)
@@ -272,7 +299,7 @@ class ObjectType:
             score = objecttype_scoreboard[self.name]
             value_type = score[0] < score[1]
         else:
-            warn("Warning: No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference"))
+            warn("No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference"))
         if value_type:
             f = "|".join(self.flags)
             f = "asOBJ_VALUE|%s" % f
@@ -287,7 +314,7 @@ class ObjectField:
         self.type = type
 
     def uses(self, typename):
-        return self.type == typename
+        return self.type.resolved == typename
 
     def pretty_name(self):
         return "%s %s::%s" % (self.type, self.clazz, self.name)
@@ -298,7 +325,7 @@ class ObjectField:
 
 typedefs      = []
 enums         = []
-objecttypes   = []
+objecttypes   = {}
 functions     = []
 objectmethods = []
 objectfields  = []
@@ -345,6 +372,11 @@ def walk(cursor):
         if not child.location.file:
             continue
         filename = child.location.file.name
+        if child.kind == cindex.CursorKind.TYPEDEF_DECL:
+            name, kind = get_typedef(child)
+            if name:
+                typedef[name] = kind
+
         if fer and fer.search(filename):
             continue
         if fir and not fir.search(filename):
@@ -358,14 +390,14 @@ def walk(cursor):
                 functions.append(Function(child))
                 add_include(filename)
             except Exception as e:
-                warn("Warning: skipping function %s - %s" % (child.spelling, e))
+                warn("Skipping function %s - %s" % (child.spelling, e))
         elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
             name, kind = get_typedef(child)
             if name:
                 typedef[name] = kind
                 typedefs.append(_assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind))))
             else:
-                warn("Warning, typedef too complex, skipping: %s" % name)
+                warn("Typedef too complex, skipping: %s" % name)
         elif child.kind == cindex.CursorKind.CLASS_DECL or child.kind == cindex.CursorKind.STRUCT_DECL:
             children = child.get_children()
             if len(children) == 0:
@@ -374,6 +406,15 @@ def walk(cursor):
             idx = cindex.CXXAccessSpecifier.PRIVATE if child.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
             access = cindex._cxx_access_specifiers[cindex.CXXAccessSpecifier.PRIVATE]
             classname = child.spelling
+            if len(classname) == 0:
+                classname = child.displayname
+                if len(classname) == 0:
+                    warn("Skipping class or struct defined at %s" % cursor.extent)
+                    continue
+            if classname in objecttypes:
+                # TODO: different namespaces
+                warn("Skipping type %s, as it is already defined" % classname)
+
             o = ObjectType(classname)
             for child in children:
                 if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
@@ -390,26 +431,25 @@ def walk(cursor):
                     try:
                         objectmethods.append(Function(child, classname))
                     except Exception as e:
-                        warn("Warning: skipping member method %s::%s - %s" % (classname, child.spelling, e))
+                        warn("Skipping member method %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.CONSTRUCTOR:
                     o.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
                 elif child.kind == cindex.CursorKind.DESTRUCTOR:
                     o.flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
                 elif child.kind == cindex.CursorKind.FIELD_DECL:
                     try:
-                        type = get_real_type(get_type(child.type))
-                        add_use(type)
+                        type = Type(child.type)
                         objectfields.append(ObjectField(classname, child.spelling, type))
                     except Exception as e:
-                        warn("Warning: skipping member field %s::%s - %s" % (classname, child.spelling, e))
+                        warn("Skipping member field %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
                     name, kind = get_typedef(child)
                     if name:
                         typedef[name] = kind
                     warn("Typedefs within classes is not supported by AngelScript")
                 else:
-                    warn("Warning, unhandled cursor: %s, %s" % (child.displayname, child.kind))
-            objecttypes.append(o)
+                    warn("Unhandled cursor: %s, %s" % (child.displayname, child.kind))
+            objecttypes[classname] = o
             add_include(filename)
         elif child.kind == cindex.CursorKind.MACRO_INSTANTIATION or \
                 child.kind == cindex.CursorKind.CONVERSION_FUNCTION or \
@@ -417,7 +457,7 @@ def walk(cursor):
                  child.kind == cindex.CursorKind.UNEXPOSED_DECL:
             continue
         else:
-            warn("Warning, unhandled cursor: %s, %s" % (child.displayname, child.kind))
+            warn("Unhandled cursor: %s, %s" % (child.displayname, child.kind))
 
 
 
@@ -432,7 +472,7 @@ def remove_ref_val_mismatches():
         ref, val = objecttype_scoreboard[key]
         if ref == 0 or val == 0:
             continue
-        warn("Warning \"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val))
+        warn("\"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val))
         toremove = "%s%s" % (key, "*" if val > ref else "")
 
         toadd = functions
@@ -453,19 +493,60 @@ def remove_ref_val_mismatches():
             else:
                 objectmethods.append(curr)
 
+def is_known(name):
+    name = name.replace("*", "").replace("&", "")
+    return name in objecttypes or name in as_builtins
+
+def unknown_filter(source):
+    toadd = source
+    ret = []
+    while len(toadd):
+        keep = True
+        curr = toadd.pop(0)
+        broken = None
+        for t in curr.args:
+            if not is_known(t.resolved):
+                broken = t.resolved
+                keep = False
+        if not is_known(curr.return_type.resolved):
+            broken = curr.return_type.resolved
+            keep = False
+        if not keep:
+            warn("Removing %s as it's using an unknown type %s [disable with -ku]" % (curr.pretty_name(), broken))
+        else:
+            ret.append(curr)
+    return ret
+
+def remove_unknowns():
+    global typedefs
+    global enums
+    global objecttypes
+    global functions
+    global objectmethods
+
+    functions = unknown_filter(functions)
+    objectmethods = unknown_filter(objectmethods)
+
 walk(tu.cursor)
 
 # File processed, do some post processing
 remove_ref_val_mismatches()
 
+if not keep_unknowns:
+    remove_unknowns()
+
 
 f = open(output_filename, "w")
-f.write("#include <angelscript.h>\n\n#include \"")
-f.write("\"\n#include \"".join(includes))
-f.write("\"\n\n")
+f.write("#include <angelscript.h>\n#include <assert.h>\n\n")
+if len(includes):
+    f.write("#include \"")
+    f.write("\"\n#include \"".join(includes))
+    f.write("\"")
+
+f.write("\n\n")
 f.write("void %s(asIScriptEngine* engine)\n{\n\tint r;\n\n\t" % funcname)
 
-f.write("\n\t".join([o.get_register_string() for o in objecttypes]))
+f.write("\n\t".join([objecttypes[o].get_register_string() for o in objecttypes]))
 f.write("\n\t")
 f.write("\n\t".join(typedefs))
 f.write("\n\t")
@@ -480,6 +561,6 @@ f.write("\n}\n")
 f.close()
 
 for diag in tu.diagnostics:
-    warn("Warning, clang had the following to say: %s" % (diag.spelling))
+    warn("clang had the following to say: %s" % (diag.spelling))
 
 print "Finished with %d warnings" % warn_count
