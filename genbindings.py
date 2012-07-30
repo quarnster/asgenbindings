@@ -88,6 +88,8 @@ def get_type(type):
         typename = "unsigned long"
     elif type.kind == cindex.TypeKind.UINT:
         typename = "unsigned int"
+    elif type.kind == cindex.TypeKind.USHORT:
+        typename = "unsigned short"
     else:
         typename = type.kind.name.lower()
     if typename is None:
@@ -180,7 +182,8 @@ class Type:
 class Function:
     def __init__(self, cursor, clazz=None):
         self.args = []
-        for child in cursor.get_children():
+        children = cursor.get_children()
+        for child in children:
             if child.kind == cindex.CursorKind.PARM_DECL:
                 t = Type(child.type)
                 t.const = is_const(child)
@@ -192,33 +195,43 @@ class Function:
         self.const = False
 
         if self.clazz:
-            tokens = cindex.tokenize(tu, cursor.extent)
-            parcount = 0
-            startLooking = False
-            for i in range(len(tokens)-1):
-                token = tokens[i]
 
-                if token.spelling == "(":
-                    parcount += 1
-                elif token.spelling == ")":
-                    parcount -= 1
-                    if parcount == 0:
-                        startLooking = True
+            start = cursor.extent.start
+            end = cursor.extent.end
+            i = 0
+            while i < len(children):
+                if children[i].kind == cindex.CursorKind.PARM_DECL:
+                    start = children[i].extent.end
+                if children[i].kind == cindex.CursorKind.COMPOUND_STMT:
+                    if i > 0:
+                        start = children[i-1].extent.end
+                    end = children[i].extent.start
+                    break
+                i += 1
+                if i == len(children):
+                    break
+                start = children[i-1].extent.end
 
-                if not startLooking:
-                    continue
 
-                if token.spelling == ";" or token.spelling == "{":
-                    break
-                elif token.spelling == "const":
-                    self.const = True
-                    break
-            for token in tokens:
-                if token.kind != cindex.TokenKind.KEYWORD:
-                    break
-                if token.spelling == "const":
-                    self.return_type.const = True
-                    break
+            r = cindex.SourceRange.from_locations(start, end)
+            f = open(cursor.location.file.name)
+            f.seek(start.offset)
+            length = end.offset-start.offset
+            data = f.read(length)
+            f.close()
+            self.const = re.search(r"\s*const\s*(=\s*0)?$", data) != None
+            if self.name == "GetTransform":
+                print data
+
+            if children[0].kind != cindex.CursorKind.PARM_DECL:
+                f = open(cursor.location.file.name)
+                f.seek(cursor.extent.start.offset)
+                length = children[0].extent.start.offset-cursor.extent.start.offset
+                data = f.read(length)
+                f.close()
+                data = re.sub(r"%s.*" % self.name, "", data)
+                self.return_type.const = re.search(r"\s*const\s*$", data) != None
+
 
     def uses(self, typename):
         if self.return_type.resolved == typename:
@@ -229,7 +242,7 @@ class Function:
         return False
 
     def pretty_name(self):
-        cargs =  ", ".join(self.cargs)
+        cargs =  ", ".join([t.get_c_type() for t in self.args])
         if self.clazz:
             return "%s %s::%s(%s)" % (self.return_type, self.clazz, self.name, cargs)
         else:
@@ -449,13 +462,14 @@ remove_ref_val_mismatches()
 f = open(output_filename, "w")
 f.write("#include <angelscript.h>\n\n#include \"")
 f.write("\"\n#include \"".join(includes))
-f.write("\"\n\n\t")
-f.write("void %s(asIScriptEngine* engine)\n{\n\t" % funcname)
+f.write("\"\n\n")
+f.write("void %s(asIScriptEngine* engine)\n{\n\tint r;\n\n\t" % funcname)
+
+f.write("\n\t".join([o.get_register_string() for o in objecttypes]))
+f.write("\n\t")
 f.write("\n\t".join(typedefs))
 f.write("\n\t")
 f.write("\n\t".join(enums))
-f.write("\n\t")
-f.write("\n\t".join([o.get_register_string() for o in objecttypes]))
 f.write("\n\t")
 f.write("\n\t".join([o.get_register_string() for o in functions]))
 f.write("\n\t")
