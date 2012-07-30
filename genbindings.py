@@ -267,8 +267,8 @@ operatornamedict = {
     "operator>>=":     "opShrAssign",
     "operator>>>=":    "opUShrAssign",
 }
-class Function:
-    def __init__(self, cursor, clazz=None):
+class Function(object):
+    def __init__(self, cursor, clazz=None, behaviour=None):
         self.args = []
         children = cursor.get_children()
         for child in children:
@@ -281,8 +281,9 @@ class Function:
         self.return_type = Type(cursor.result_type)
         self.clazz = clazz
         self.const = False
+        self.behaviour = behaviour
 
-        if self.clazz:
+        if self.clazz and not behaviour:
             start = cursor.extent.start
             end = cursor.extent.end
             i = 0
@@ -361,7 +362,18 @@ class Function:
             asargs.append(asname)
         asargs = ", ".join(asargs)
 
-        name = "%s %s(%s)" % (self.return_type.get_as_type(), name, asargs)
+        if self.behaviour == "asBEHAVE_CONSTRUCT":
+            name = "void f(%s)" % (asargs)
+
+            if self.clazz in objecttype_scoreboard:
+                score = objecttype_scoreboard[self.clazz]
+                if score[0] > score[1]:
+                    name = "%s@ f(%s)" % (self.clazz, asargs)
+                    self.behaviour = "asBEHAVE_FACTORY"
+        elif self.behaviour == "asBEHAVE_DESTRUCT":
+            name = "void f()"
+        else:
+            name = "%s %s(%s)" % (self.return_type.get_as_type(), name, asargs)
         if self.clazz and self.const:
             name += " const"
 
@@ -381,7 +393,7 @@ class Function:
         name = self.name
         if "operator" in name:
             name = operatornamedict[name]
-        name = name + "_generic"
+        name = name.replace("~", "tilde") + "_generic"
         for arg in self.args:
             name += "_" + arg.get_c_type().replace("&", "amp").replace("*", "star").replace(" ", "space")
         if self.clazz:
@@ -390,7 +402,10 @@ class Function:
         asret = self.return_type.get_as_type()
         call = "%s(" % self.name
         if self.clazz:
-            call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
+            if self.behaviour == "asBEHAVE_CONSTRUCT":
+                call = "new(gen->GetAddressOfReturnLocation()) %s(" %self.name
+            else:
+                call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
 
         for i in range(len(self.args)):
             if i > 0:
@@ -431,7 +446,11 @@ class Function:
             call = "asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL" % (self.clazz, self.name, cargs, const, self.return_type.get_c_type())
             if generic_wrappers != None:
                 call = self.get_generic()
-            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", %s);" % (self.clazz, self.asname(), call))
+            if self.behaviour == None:
+                return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", %s);" % (self.clazz, self.asname(), call))
+            else:
+                name = self.asname()
+                return _assert("engine->RegisterObjectBehaviour(\"%s\", %s, \"%s\", %s);" % (self.clazz, self.behaviour, name, call))
 
 
 class ObjectType:
@@ -509,6 +528,7 @@ functions     = []
 objectmethods = []
 objectfields  = []
 includes      = []
+behaviours     = []
 
 def _assert(line):
     if doassert:
@@ -620,8 +640,18 @@ def walk(cursor):
                         warn("Skipping member method %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.CONSTRUCTOR:
                     o.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
+                    try:
+                        f = Function(child, classname, "asBEHAVE_CONSTRUCT")
+                        behaviours.append(f)
+                    except Exception as e:
+                        warn("Skipping constructor %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.DESTRUCTOR:
                     o.flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
+                    try:
+                        f = Function(child, classname, "asBEHAVE_DESTRUCT")
+                        behaviours.append(f)
+                    except Exception as e:
+                        warn("Skipping destructor %s::%s - %s" % (classname, child.spelling, e))
                 elif child.kind == cindex.CursorKind.FIELD_DECL:
                     try:
                         type = Type(child.type)
@@ -648,12 +678,21 @@ def walk(cursor):
 
 
 # Removes usage of object types that are used both as a reference and a value type
+def mismatch_filter(source, toremove):
+    toadd =source
+    ret = []
+    while len(toadd):
+        curr = toadd.pop(0)
+        if curr.uses(toremove):
+            warn("\t%s" % curr.pretty_name())
+        else:
+            ret.append(curr)
+    return ret
+
 def remove_ref_val_mismatches():
-    global typedefs
-    global enums
-    global objecttypes
     global functions
     global objectmethods
+    global behaviours
     for key in objecttype_scoreboard:
         ref, val = objecttype_scoreboard[key]
         if ref == 0 or val == 0:
@@ -661,23 +700,10 @@ def remove_ref_val_mismatches():
         warn("\"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val))
         toremove = "%s%s" % (key, "*" if val > ref else "")
 
-        toadd = functions
-        functions = []
-        while len(toadd):
-            curr = toadd.pop(0)
-            if curr.uses(toremove):
-                warn("\t%s" % curr.pretty_name())
-            else:
-                functions.append(curr)
+        functions = mismatch_filter(functions, toremove)
+        objectmethods = mismatch_filter(objectmethods, toremove)
+        behaviours = mismatch_filter(behaviours, toremove)
 
-        toadd = objectmethods
-        objectmethods = []
-        while len(toadd):
-            curr = toadd.pop(0)
-            if curr.uses(toremove):
-                warn("\t%s" % curr.pretty_name())
-            else:
-                objectmethods.append(curr)
 
 def is_known(name):
     name = name.replace("*", "").replace("&", "")
@@ -706,9 +732,11 @@ def unknown_filter(source):
 def remove_unknowns():
     global functions
     global objectmethods
+    global behaviours
 
     functions = unknown_filter(functions)
     objectmethods = unknown_filter(objectmethods)
+    behaviours = unknown_filter(behaviours)
 
 
 def dup_filter(source):
@@ -731,8 +759,11 @@ def dup_filter(source):
 def remove_duplicates():
     global functions
     global objectmethods
+    global behaviours
+
     functions = dup_filter(functions)
     objectmethods = dup_filter(objectmethods)
+    behaviours = dup_filter(behaviours)
 
 walk(tu.cursor)
 
@@ -762,6 +793,8 @@ data += "\n\t"
 data += "\n\t".join(enums)
 data += "\n\t"
 data += "\n\t".join([o.get_register_string() for o in functions])
+data += "\n\t"
+data += "\n\t".join([o.get_register_string() for o in behaviours])
 data += "\n\t"
 data += "\n\t".join([o.get_register_string() for o in objectmethods])
 data += "\n\t"
