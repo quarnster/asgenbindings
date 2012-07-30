@@ -32,6 +32,7 @@ mer = None
 funcname = "RegisterMyTypes"
 doassert = True
 keep_unknowns = False
+generic_wrappers = None
 i = 1
 clang_args = []
 while i < len(sys.argv):
@@ -59,6 +60,8 @@ while i < len(sys.argv):
         funcname = sys.argv[i]
     elif sys.argv[i] == "-ku":
         keep_unknowns = True
+    elif sys.argv[i] == "-gen":
+        generic_wrappers = []
     else:
         clang_args.append(sys.argv[i])
     i += 1
@@ -74,6 +77,7 @@ if output_filename == None:
       -noassert            Don't do the assert check when registering
       -f        <name>     Name of the generated function
       -ku                  Keep functions and members declared with an unknown type. Useful if that type is registered elsewhere.
+      -gen                 Generate generic function call wrappers
 
     Any unknown parameters will be forwarded to clang""" % (sys.argv[0])
     sys.exit(1)
@@ -224,6 +228,45 @@ class Type:
         return "%s%s" % ("const " if self.const else "", self.cname)
 
 
+
+operatornamedict = {
+    "-operator":       "opNeg",
+    "~operator":       "opCom",
+    "++operator":      "opPreInc",
+    "--operator":      "opPreDec",
+    "operator==":      "opEquals",
+    #"operator!=":      "opEquals",
+    "operator<":       "opCmp",
+    # "operator<=":      "opCmp",
+    # "operator>":       "opCmp",
+    # "operator>=":      "opCmp",
+    "operator++":      "opPostInc",
+    "operator--":      "opPostDec",
+    "operator+":       "opAdd",
+    "operator-":       "opSub",
+    "operator*":       "opMul",
+    "operator/":       "opDiv",
+    "operator%":       "opMod",
+    "operator&":       "opAnd",
+    "operator|":       "opOr",
+    "operator^":       "opXor",
+    "operator<<":      "opShl",
+    "operator>>":      "opShr",
+    "operator>>>":     "opUShr",
+    "operator[]":      "opIndex",
+    "operator=":       "opAssign",
+    "operator+=":      "opAddAssign",
+    "operator-=":      "opSubAssign",
+    "operator*=":      "opMulAssign",
+    "operator/=":      "opDivAssign",
+    "operator%=":      "opModAssign",
+    "operator&=":      "opAndAssign",
+    "operator|=":      "opOrAssign",
+    "operator^=":      "opXorAssign",
+    "operator<<=":     "opShlAssign",
+    "operator>>=":     "opShrAssign",
+    "operator>>>=":    "opUShrAssign",
+}
 class Function:
     def __init__(self, cursor, clazz=None):
         self.args = []
@@ -297,49 +340,12 @@ class Function:
             return "%s %s(%s)" % (self.return_type, self.name, cargs)
 
     def asname(self):
-        namedict = {
-            "-operator":       "opNeg",
-            "~operator":       "opCom",
-            "++operator":      "opPreInc",
-            "--operator":      "opPreDec",
-            "operator==":      "opEquals",
-            "operator!=":      "opEquals",
-            "operator<":       "opCmp",
-            "operator<=":      "opCmp",
-            "operator>":       "opCmp",
-            "operator>=":      "opCmp",
-            "operator++":      "opPostInc",
-            "operator--":      "opPostDec",
-            "operator+":       "opAdd",
-            "operator-":       "opSub",
-            "operator*":       "opMul",
-            "operator/":       "opDiv",
-            "operator%":       "opMod",
-            "operator&":       "opAnd",
-            "operator|":       "opOr",
-            "operator^":       "opXor",
-            "operator<<":      "opShl",
-            "operator>>":      "opShr",
-            "operator>>>":     "opUShr",
-            "operator[]":      "opIndex",
-            "operator=":       "opAssign",
-            "operator+=":      "opAddAssign",
-            "operator-=":      "opSubAssign",
-            "operator*=":      "opMulAssign",
-            "operator/=":      "opDivAssign",
-            "operator%=":      "opModAssign",
-            "operator&=":      "opAndAssign",
-            "operator|=":      "opOrAssign",
-            "operator^=":      "opXorAssign",
-            "operator<<=":     "opShlAssign",
-            "operator>>=":     "opShrAssign",
-            "operator>>>=":    "opUShrAssign",
-        }
+
         name = self.name
         if "operator" in name:
-            if name not in namedict:
+            if name not in operatornamedict:
                 raise Exception("Operator not supported in AngelScript %s" % self.pretty_name())
-            name = namedict[name]
+            name = operatornamedict[name]
         asargs = []
         for a in self.args:
             asname = a.get_as_type()
@@ -361,16 +367,71 @@ class Function:
 
         return name
 
-    def get_register_string(self):
+    def get_generic(self):
+        lut = {
+            "double": "Double",
+            "float": "Float",
+            "uint": "DWord",
+            "int": "DWord",
+            "uint16": "Word",
+            "int16": "Word",
+            "uint8": "Byte",
+            "int8": "Byte"
+        }
+        name = self.name
+        if "operator" in name:
+            name = operatornamedict[name]
+        name = name + "_generic"
+        for arg in self.args:
+            name += "_" + arg.get_c_type().replace("&", "amp").replace("*", "star").replace(" ", "space")
+        if self.clazz:
+            name = self.clazz + "_" + name
+        func = "void %s(asIScriptGeneric *gen)\n{\n" % name
+        asret = self.return_type.get_as_type()
+        call = "%s(" % self.name
+        if self.clazz:
+            call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
 
+        for i in range(len(self.args)):
+            if i > 0:
+                call += ", "
+            arg = self.args[i]
+            t = arg.get_as_type()
+            if t in lut:
+                call += "gen->GetArg%s(%d)" % (lut[t], i)
+            else:
+                call += "*static_cast<%s*>(gen->GetArgAddress(%d))" % (arg.get_c_type().replace("&", ""), i)
+        call += ")"
+        if asret in lut:
+            func += "\tgen->SetReturn%s(%s);\n" % (lut[asret], call)
+        elif asret == "void":
+            func += "\t" + call + ";\n"
+        else:
+            func += "\t" + self.return_type.get_c_type() + " ret = %s;\n" % call
+            func += "\tnew(gen->GetAddressOfReturnLocation()) %s(ret);\n" % self.return_type.get_c_type().replace("&", "")
+        func += "}\n"
+        generic_wrappers.append(func)
+
+        return "asFUNCTION(%s), asCALL_GENERIC" % (name)
+
+
+    def get_register_string(self):
+        global generic_wrappers
         cargs =  ", ".join([at.get_c_type()  for at in self.args])
+
         if self.clazz == None:
-            return _assert("engine->RegisterGlobalFunction(\"%s\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" %
-                        (self.asname(), self.name, cargs, self.return_type.get_c_type()))
+            callconv = "asCALL_CDECL"
+            call = "asFUNCTIONPR(%s, (%s), %s), %s" % (self.name, cargs, self.return_type.get_c_type(), callconv)
+
+            if generic_wrappers != None:
+                call = self.get_generic()
+            return _assert("engine->RegisterGlobalFunction(\"%s\", %s);" % (self.asname(), call))
         else:
             const = " const" if self.const else ""
-            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL);" %
-                (self.clazz, self.asname(), self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
+            call = "asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL" % (self.clazz, self.name, cargs, const, self.return_type.get_c_type())
+            if generic_wrappers != None:
+                call = self.get_generic()
+            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", %s);" % (self.clazz, self.asname(), call))
 
 
 class ObjectType:
@@ -418,11 +479,10 @@ class ObjectType:
             f = "|".join(self.flags)
             f = "asOBJ_VALUE|%s" % f
             return _assert("engine->RegisterObjectType(\"%s\", sizeof(%s), %s);" % (self.name, self.name, f))
-        else:
-            ret = _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name)) + \
-            "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name)) + \
-            "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
-            return ret
+        ret = _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name)) + \
+        "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name)) + \
+        "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
+        return ret
 
 
 
@@ -441,7 +501,6 @@ class ObjectField:
 
     def get_register_string(self):
         return _assert("engine->RegisterObjectProperty(\"%s\", \"%s %s\", asOFFSET(%s,%s));" % (self.clazz, self.type, self.name, self.clazz, self.name))
-
 
 typedefs      = []
 enums         = []
@@ -645,14 +704,35 @@ def unknown_filter(source):
     return ret
 
 def remove_unknowns():
-    global typedefs
-    global enums
-    global objecttypes
     global functions
     global objectmethods
 
     functions = unknown_filter(functions)
     objectmethods = unknown_filter(objectmethods)
+
+
+def dup_filter(source):
+    toadd = source
+    ret = []
+    names = []
+    while len(toadd):
+        keep = True
+        curr = toadd.pop(0)
+        pn = curr.pretty_name()
+        if "operator==" in pn:
+            print pn
+        if pn in names:
+            warn("Removing duplicate function %s" % pn)
+        else:
+            ret.append(curr)
+            names.append(pn)
+    return ret
+
+def remove_duplicates():
+    global functions
+    global objectmethods
+    functions = dup_filter(functions)
+    objectmethods = dup_filter(objectmethods)
 
 walk(tu.cursor)
 
@@ -661,30 +741,39 @@ remove_ref_val_mismatches()
 
 if not keep_unknowns:
     remove_unknowns()
+remove_duplicates()
 
 
 f = open(output_filename, "w")
 f.write("#include <angelscript.h>\n#include <assert.h>\n\n")
+
 if len(includes):
     f.write("#include \"")
     f.write("\"\n#include \"".join(includes))
     f.write("\"")
 
 f.write("\n\n")
-f.write("void %s(asIScriptEngine* engine)\n{\n\tint r;\n\n\t" % funcname)
 
-f.write("\n\t".join([objecttypes[o].get_register_string() for o in objecttypes]))
-f.write("\n\t")
-f.write("\n\t".join(typedefs))
-f.write("\n\t")
-f.write("\n\t".join(enums))
-f.write("\n\t")
-f.write("\n\t".join([o.get_register_string() for o in functions]))
-f.write("\n\t")
-f.write("\n\t".join([o.get_register_string() for o in objectmethods]))
-f.write("\n\t")
-f.write("\n\t".join([o.get_register_string() for o in objectfields]))
-f.write("\n}\n")
+data  = "void %s(asIScriptEngine* engine)\n{\n\tint r;\n\n\t" % funcname
+data += "\n\t".join([objecttypes[o].get_register_string() for o in objecttypes])
+data += "\n\t"
+data += "\n\t".join(typedefs)
+data += "\n\t"
+data += "\n\t".join(enums)
+data += "\n\t"
+data += "\n\t".join([o.get_register_string() for o in functions])
+data += "\n\t"
+data += "\n\t".join([o.get_register_string() for o in objectmethods])
+data += "\n\t"
+data += "\n\t".join([o.get_register_string() for o in objectfields])
+data += "\n}\n"
+
+if generic_wrappers != None:
+    f.write("\n".join(generic_wrappers))
+    f.write("\n\n")
+
+f.write(data)
+
 f.close()
 
 for diag in tu.diagnostics:
