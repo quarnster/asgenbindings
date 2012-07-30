@@ -27,6 +27,8 @@ output_filename = None
 verbose = False
 fir = None
 fer = None
+mir = None
+mer = None
 funcname = "RegisterMyTypes"
 doassert = True
 keep_unknowns = False
@@ -44,6 +46,12 @@ while i < len(sys.argv):
     elif sys.argv[i] == "-fer":
         i += 1
         fer = re.compile(sys.argv[i])
+    elif sys.argv[i] == "-mir":
+        i += 1
+        mir = re.compile(sys.argv[i])
+    elif sys.argv[i] == "-mer":
+        i += 1
+        mer = re.compile(sys.argv[i])
     elif sys.argv[i] == "-noassert":
         doassert = False
     elif sys.argv[i] == "-f":
@@ -61,6 +69,8 @@ if output_filename == None:
       -v                   Enable verbose warning output
       -fir      <pattern>  File Inclusion Regex. Only cursors coming from file names matching the regex pattern will be added.
       -fer      <pattern>  File Exclusion regex. Cursors for which the filename matches the regex pattern will be excluded.
+      -mir      <pattern>  Method/function Inclusion Regex. Only methods/functions matching the regex pattern will be added.
+      -mer      <pattern>  Method/function Exclusion regex. Methods/functions that match the regex pattern will be excluded.
       -noassert            Don't do the assert check when registering
       -f        <name>     Name of the generated function
       -ku                  Keep functions and members declared with an unknown type. Useful if that type is registered elsewhere.
@@ -80,7 +90,7 @@ def warn(msg):
     if verbose:
         print msg
 
-def get_type(type):
+def get_type(type, cursor=None):
     pointer = type.kind == cindex.TypeKind.POINTER
     typename = ""
     ref = type.kind == cindex.TypeKind.LVALUEREFERENCE
@@ -94,6 +104,11 @@ def get_type(type):
         typename = "unsigned int"
     elif type.kind == cindex.TypeKind.USHORT:
         typename = "unsigned short"
+    elif type.kind == cindex.TypeKind.CONSTANTARRAY:
+        if cursor is None:
+            raise Exception("Constant array, but cursor not provided so can't solve the type")
+
+        typename = get_type(type.get_array_element_type())
     else:
         typename = type.kind.name.lower()
     if typename is None:
@@ -250,7 +265,7 @@ class Function:
             f.close()
             self.const = re.search(r"\s*const\s*(=\s*0)?$", data) != None
 
-            if children[0].kind != cindex.CursorKind.PARM_DECL:
+            if len(children) > 0 and children[0].kind != cindex.CursorKind.PARM_DECL:
                 f = open(cursor.location.file.name)
                 f.seek(cursor.extent.start.offset)
                 length = children[0].extent.start.offset-cursor.extent.start.offset
@@ -259,6 +274,12 @@ class Function:
                 data = re.sub(r"%s.*" % self.name, "", data)
                 self.return_type.const = re.search(r"\s*const\s*$", data) != None
         self.asname()
+        if mir or mer:
+            pn = self.pretty_name()
+            if mer and mer.search(pn):
+                raise Exception("Function matches exclusion pattern. %s" % pn)
+            if mir and not mir.search(pn):
+                raise Exception("Function does not match inclusion pattern. %s" % pn)
 
     def uses(self, typename):
         if self.return_type.resolved == typename:
@@ -319,25 +340,72 @@ class Function:
             if name not in namedict:
                 raise Exception("Operator not supported in AngelScript %s" % self.pretty_name())
             name = namedict[name]
+        asargs = []
+        for a in self.args:
+            asname = a.get_as_type()
+            ref = "&" in asname
+            if ref:
+                asname2 = get_as_type(a.resolved)[:-1]
+                extra = ""
+                if asname2 in objecttype_scoreboard:
+                    score = objecttype_scoreboard[asname2]
+                    if score[1] >= score[0]:
+                        # Value types can only be in or out references. Defaulting to in
+                        asname += "in"
+            asargs.append(asname)
+        asargs = ", ".join(asargs)
+
+        name = "%s %s(%s)" % (self.return_type.get_as_type(), name, asargs)
+        if self.clazz and self.const:
+            name += " const"
+
         return name
 
     def get_register_string(self):
-        asargs = ", ".join([at.get_as_type() for at in self.args])
+
         cargs =  ", ".join([at.get_c_type()  for at in self.args])
         if self.clazz == None:
-            return _assert("engine->RegisterGlobalFunction(\"%s %s(%s)\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" %
-                        (self.return_type.get_as_type(), self.name, asargs,
-                         self.name, cargs, self.return_type.get_c_type()))
+            return _assert("engine->RegisterGlobalFunction(\"%s\", asFUNCTIONPR(%s, (%s), %s), asCALL_CDECL);" %
+                        (self.asname(), self.name, cargs, self.return_type.get_c_type()))
         else:
             const = " const" if self.const else ""
-            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s %s(%s)%s\", asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL);" %
-                (self.clazz, self.return_type.get_as_type(), self.asname(), asargs, const, self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
+            return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL);" %
+                (self.clazz, self.asname(), self.clazz, self.name, cargs, const, self.return_type.get_c_type()))
 
 
 class ObjectType:
-    def __init__(self, name):
+    def add_fields(self, children, array):
+        for child in children:
+            if child.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
+                self.add_fields(child.get_reference().get_children(), array)
+            if child.kind == cindex.CursorKind.FIELD_DECL:
+                array.append(child)
+
+    def __init__(self, cursor, children, name):
+        self.cursor = cursor
         self.name = name
         self.flags = {"asOBJ_APP_CLASS": True}
+        fields = []
+
+        #self.add_fields(children, fields)
+        #if len(fields):
+        #    try:
+        #        child = fields.pop(0)
+        #        t = get_real_type(get_type(child.type, child))
+        #        allEqual = True
+        #        for field in fields:
+        #            t2 = get_real_type(get_type(field.type, field))
+        #            if t2 != t:
+        #                break
+        #        if allEqual:
+        #            if t == "float":
+        #                self.flags["asOBJ_APP_CLASS_ALLFLOATS"] = True
+        #            elif t == "int" or t == "unsigned int":
+        #                self.flags["asOBJ_APP_CLASS_ALLINTS"] = True
+        #            print "%s has all fields of equal type: %s" % (self.name, t)
+        #    except:
+        #        pass
+
 
     def get_register_string(self):
         value_type = True
@@ -351,7 +419,13 @@ class ObjectType:
             f = "asOBJ_VALUE|%s" % f
             return _assert("engine->RegisterObjectType(\"%s\", sizeof(%s), %s);" % (self.name, self.name, f))
         else:
-            return _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name))
+            ret = _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name)) + \
+            "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name)) + \
+            "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
+            return ret
+
+
+
 
 class ObjectField:
     def __init__(self, clazz, name, type):
@@ -433,7 +507,11 @@ def walk(cursor):
                 enums.append(_assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling)))
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
-                functions.append(Function(child))
+                f = Function(child)
+                if "operator" in f.name:
+                    raise Exception("Non member operator functions not supported currently")
+                else:
+                    functions.append(f)
                 add_include(filename)
             except Exception as e:
                 warn("Skipping function %s - %s" % (child.spelling, e))
@@ -441,7 +519,10 @@ def walk(cursor):
             name, kind = get_typedef(child)
             if name:
                 typedef[name] = kind
-                typedefs.append(_assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind))))
+                if get_real_type(kind) not in as_builtins:
+                    warn("Typedef %s = %s can't be registered as it doesn't resolve to an AngelScript builtin type" % (name, kind))
+                else:
+                    typedefs.append(_assert("engine->RegisterTypedef(\"%s\", \"%s\");" % (name, get_real_type(kind))))
             else:
                 warn("Typedef too complex, skipping: %s" % name)
         elif child.kind == cindex.CursorKind.CLASS_DECL or child.kind == cindex.CursorKind.STRUCT_DECL:
@@ -461,7 +542,7 @@ def walk(cursor):
                 # TODO: different namespaces
                 warn("Skipping type %s, as it is already defined" % classname)
 
-            o = ObjectType(classname)
+            o = ObjectType(cursor, children, classname)
             for child in children:
                 if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
                     access = child.get_cxx_access_specifier()
