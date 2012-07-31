@@ -485,6 +485,23 @@ class Function(object):
                 name = self.asname()
                 return _assert("engine->RegisterObjectBehaviour(\"%s\", %s, \"%s\", %s);" % (self.clazz, self.behaviour, name, call))
 
+def is_pure_virtual(cursor):
+    children = cursor.get_children()
+    start = cursor.extent.start
+    end = cursor.extent.end
+    while len(children) != 0:
+        child = children[-1]
+        children = child.get_children()
+        start = child.extent.end
+
+    f = open(cursor.location.file.name)
+    f.seek(start.offset)
+    length = end.offset-start.offset
+    data = f.read(length)
+    f.close()
+
+    return re.search(r"=\s*0\s*$", data) != None
+
 
 objectindex = 0
 class ObjectType:
@@ -504,6 +521,7 @@ class ObjectType:
         self.parents = []
         self.index = objectindex
         objectindex += 1
+        self.has_pure_virtuals = False
 
         idx = cindex.CXXAccessSpecifier.PRIVATE if cursor.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
         access = cindex._cxx_access_specifiers[idx]
@@ -546,6 +564,8 @@ class ObjectType:
                     objectmethods.append(Function(child, self.name))
                 except Exception as e:
                     warn("Skipping member method %s::%s - %s" % (self.name, child.spelling, e))
+                if is_pure_virtual(child):
+                    self.has_pure_virtuals = True
             elif child.kind == cindex.CursorKind.CONSTRUCTOR:
                 self.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
                 try:
@@ -872,6 +892,22 @@ def remove_reference_destructors():
         else:
             behaviours.append(curr)
 
+def remove_pure_virtual_constructors():
+    global behaviours
+    toadd = behaviours
+    behaviours = []
+    while len(toadd):
+        curr = toadd.pop(0)
+        virt = False
+        if curr.clazz in objecttypes:
+            virt = objecttypes[curr.clazz].has_pure_virtuals
+
+        if virt and (curr.behaviour == "asBEHAVE_CONSTRUCT" or curr.behaviour == "asBEHAVE_FACTORY"):
+            warn("Removing constructor for type %s which has pure virtual members" % curr.clazz)
+        else:
+            behaviours.append(curr)
+
+
 walk(tu.cursor)
 
 # File processed, do some post processing
@@ -881,6 +917,7 @@ if not keep_unknowns:
     remove_unknowns()
 remove_duplicates()
 remove_reference_destructors()
+remove_pure_virtual_constructors()
 
 
 f = sys.stdout
