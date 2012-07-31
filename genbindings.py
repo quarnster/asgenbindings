@@ -21,70 +21,45 @@
 from clang import cindex
 import sys
 import re
+import json
 
 
-output_filename = None
-verbose = False
-fir = None
-fer = None
-mir = None
-mer = None
-funcname = "RegisterMyTypes"
-doassert = True
-keep_unknowns = False
-generic_wrappers = None
 i = 1
-clang_args = []
-while i < len(sys.argv):
-    if sys.argv[i] == "-o":
-        i += 1
-        output_filename = sys.argv[i]
-    elif sys.argv[i] == "-v":
-        verbose = True
-    elif sys.argv[i] == "-fir":
-        i += 1
-        fir = re.compile(sys.argv[i])
-    elif sys.argv[i] == "-fer":
-        i += 1
-        fer = re.compile(sys.argv[i])
-    elif sys.argv[i] == "-mir":
-        i += 1
-        mir = re.compile(sys.argv[i])
-    elif sys.argv[i] == "-mer":
-        i += 1
-        mer = re.compile(sys.argv[i])
-    elif sys.argv[i] == "-noassert":
-        doassert = False
-    elif sys.argv[i] == "-f":
-        i += 1
-        funcname = sys.argv[i]
-    elif sys.argv[i] == "-ku":
-        keep_unknowns = True
-    elif sys.argv[i] == "-gen":
-        generic_wrappers = []
-    else:
-        clang_args.append(sys.argv[i])
-    i += 1
 
-if output_filename == None:
-    print """usage: %s -o <output-filename> <options to use with clang>
-      -o        <filename> Specify which file to save output to"
-      -v                   Enable verbose warning output
-      -fir      <pattern>  File Inclusion Regex. Only cursors coming from file names matching the regex pattern will be added.
-      -fer      <pattern>  File Exclusion regex. Cursors for which the filename matches the regex pattern will be excluded.
-      -mir      <pattern>  Method/function Inclusion Regex. Only methods/functions matching the regex pattern will be added.
-      -mer      <pattern>  Method/function Exclusion regex. Methods/functions that match the regex pattern will be excluded.
-      -noassert            Don't do the assert check when registering
-      -f        <name>     Name of the generated function
-      -ku                  Keep functions and members declared with an unknown type. Useful if that type is registered elsewhere.
-      -gen                 Generate generic function call wrappers
-
-    Any unknown parameters will be forwarded to clang""" % (sys.argv[0])
+if len(sys.argv) != 2:
+    print "usage: %s configfile.json"
     sys.exit(1)
+
+
+f = open(sys.argv[1])
+config = json.load(f)
+f.close()
+
+
+def get(name, default=None):
+    if name in config:
+        return config[name]
+    else:
+        return default
+
+fir = get("file_include_regex", None)
+fer = get("file_exclude_regex", None)
+mir = get("method_include_regex", None)
+mer = get("method_exclude_regex", None)
+fir = re.compile(fir) if fir else fir
+fer = re.compile(fer) if fer else fer
+mir = re.compile(mir) if mir else mir
+mer = re.compile(mer) if mer else mer
+verbose = get("verbose", False)
+doassert = get("assert", True)
+keep_unknowns = get("keep_unknowns", False)
+output_filename = get("output_filename", None)
+funcname = get("function_name", "RegisterMyTypes")
+generic_wrappers = [] if get("generate_generic_wrappers", False) else None
 
 index = cindex.Index.create()
 
-tu = index.parse(None, clang_args, [], 13)
+tu = index.parse(None, get("clang_args", []), [], 13)
 
 
 warn_count = 0
@@ -92,7 +67,7 @@ def warn(msg):
     global warn_count
     warn_count += 1
     if verbose:
-        print msg
+        sys.stderr.write(msg + "\n")
 
 def get_type(type, cursor=None):
     pointer = type.kind == cindex.TypeKind.POINTER
@@ -665,6 +640,8 @@ def walk(cursor):
                     warn("Typedefs within classes is not supported by AngelScript")
                 else:
                     warn("Unhandled cursor: %s, %s" % (child.displayname, child.kind))
+            if "asOBJ_APP_CLASS_DESTRUCTOR" not in o.flags:
+                o.flags["asOBJ_POD"] = True
             objecttypes[classname] = o
             add_include(filename)
         elif child.kind == cindex.CursorKind.MACRO_INSTANTIATION or \
@@ -747,8 +724,6 @@ def dup_filter(source):
         keep = True
         curr = toadd.pop(0)
         pn = curr.pretty_name()
-        if "operator==" in pn:
-            print pn
         if pn in names:
             warn("Removing duplicate function %s" % pn)
         else:
@@ -775,7 +750,9 @@ if not keep_unknowns:
 remove_duplicates()
 
 
-f = open(output_filename, "w")
+f = sys.stdout
+if output_filename != None:
+    f = open(output_filename, "w")
 f.write("#include <angelscript.h>\n#include <assert.h>\n\n")
 
 if len(includes):
@@ -806,10 +783,10 @@ if generic_wrappers != None:
     f.write("\n\n")
 
 f.write(data)
-
-f.close()
+if output_filename != None:
+    f.close()
 
 for diag in tu.diagnostics:
     warn("clang had the following to say: %s" % (diag.spelling))
 
-print "Finished with %d warnings" % warn_count
+sys.stderr.write("Finished with %d warnings\n" % warn_count)
