@@ -51,6 +51,8 @@ oir = get("object_include_regex", None)
 oer = get("object_exclude_regex", None)
 mfir = get("field_include_regex", None)
 mfer = get("field_exclude_regex", None)
+generic_regex = get("generic_wrapper_regex", None)
+
 fir = re.compile(fir) if fir else fir
 fer = re.compile(fer) if fer else fer
 mir = re.compile(mir) if mir else mir
@@ -59,12 +61,15 @@ oir = re.compile(oir) if oir else oir
 oer = re.compile(oer) if oer else oer
 mfir = re.compile(mfir) if mfir else mfir
 mfer = re.compile(mfer) if mfer else mfer
+generic_regex = re.compile(generic_regex) if generic_regex else generic_regex
+
 verbose = get("verbose", False)
 doassert = get("assert", True)
 keep_unknowns = get("keep_unknowns", False)
 output_filename = get("output_filename", None)
 funcname = get("function_name", "RegisterMyTypes")
-generic_wrappers = [] if get("generate_generic_wrappers", False) else None
+
+generic_wrappers = []
 
 index = cindex.Index.create()
 
@@ -463,13 +468,16 @@ class Function(object):
             callconv = "asCALL_CDECL"
             call = "asFUNCTIONPR(%s, (%s), %s), %s" % (self.name, cargs, self.return_type.get_c_type(), callconv)
 
-            if generic_wrappers != None:
+            if generic_regex and generic_regex.search(self.pretty_name()):
                 call = self.get_generic()
             return _assert("engine->RegisterGlobalFunction(\"%s\", %s);" % (self.asname(), call))
         else:
             const = " const" if self.const else ""
             call = "asMETHODPR(%s, %s, (%s)%s, %s), asCALL_THISCALL" % (self.clazz, self.name, cargs, const, self.return_type.get_c_type())
-            if generic_wrappers != None:
+            if (generic_regex and generic_regex.search(self.pretty_name())) or \
+                    self.behaviour == "asBEHAVE_CONSTRUCT" or \
+                    self.behaviour == "asBEHAVE_DESTRUCT" or \
+                    self.behaviour == "asBEHAVE_FACTORY":
                 call = self.get_generic()
             if self.behaviour == None:
                 return _assert("engine->RegisterObjectMethod(\"%s\", \"%s\", %s);" % (self.clazz, self.asname(), call))
@@ -924,9 +932,8 @@ data += "\n\t"
 data += "\n\t".join([o.get_register_string() for o in objectfields])
 data += "\n}\n"
 
-if generic_wrappers != None:
-    f.write("\n".join(generic_wrappers))
-    f.write("\n\n")
+f.write("\n".join(generic_wrappers))
+f.write("\n\n")
 
 f.write(data)
 if output_filename != None:
