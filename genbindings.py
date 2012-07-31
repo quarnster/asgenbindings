@@ -270,6 +270,9 @@ operatornamedict = {
 class Function(object):
     def __init__(self, cursor, clazz=None, behaviour=None):
         self.args = []
+        if cursor is None:
+            return
+
         children = cursor.get_children()
         for child in children:
             if child.kind == cindex.CursorKind.PARM_DECL:
@@ -385,7 +388,8 @@ class Function(object):
             "uint16": "Word",
             "int16": "Word",
             "uint8": "Byte",
-            "int8": "Byte"
+            "int8": "Byte",
+            "bool": "Byte"
         }
         name = self.name
         if "operator" in name:
@@ -403,9 +407,9 @@ class Function(object):
                 self.behaviour = "asBEHAVE_FACTORY"
 
             if self.behaviour == "asBEHAVE_FACTORY":
-                call = "*((%s**)(gen->GetAddressOfReturnLocation())) = new %s(" % (self.name, self.name)
+                call = "gen->SetReturnObject(new %s(" % (self.name)
             elif self.behaviour == "asBEHAVE_CONSTRUCT":
-                call = "new(gen->GetAddressOfReturnLocation()) %s(" % self.name
+                call = "new(gen->GetObject()) %s(" % self.name
             else:
                 call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
 
@@ -422,13 +426,29 @@ class Function(object):
                 star = "*" if not pt else ""
                 call += "%sstatic_cast<%s%s>(gen->GetArgAddress(%d))" % (star, arg.get_c_type().replace("&", ""), star, i)
         call += ")"
-        if asret in lut:
-            func += "\tgen->SetReturn%s(%s);\n" % (lut[asret], call)
+        if self.behaviour == "asBEHAVE_FACTORY":
+            call += ")"
+
+        asret2 = asret.replace("const ", "").strip()
+        if asret2 in lut:
+            func += "\tgen->SetReturn%s(%s);\n" % (lut[asret2], call)
         elif asret == "void":
             func += "\t" + call + ";\n"
         else:
-            func += "\t" + self.return_type.get_c_type() + " ret = %s;\n" % call
-            func += "\tnew(gen->GetAddressOfReturnLocation()) %s(ret);\n" % self.return_type.get_c_type().replace("&", "")
+            ct = self.return_type.get_c_type()
+            pt = "*" in ct
+            star = "*" if not pt else ""
+            if pt:
+                func += "\tgen->SetReturnObject(%s);\n" % (call)
+            elif "&" in ct:
+                func += "\tgen->SetReturnAddress((void*)&%s);\n" % (call)
+            else:
+
+                func += "\t" + self.return_type.get_c_type().replace("&", "").replace("const ", "") + " ret = %s;\n" % call
+                func += "\tgen->SetReturnObject(&ret);\n"
+
+                #func += "\t" + self.return_type.get_c_type() + " ret = %s;\n" % call
+                #func += "\tnew(gen->GetAddressOfReturnLocation()) %s(ret);\n" % self.return_type.get_c_type().replace("&", "")
         func += "}\n"
         generic_wrappers.append(func)
 
@@ -589,8 +609,19 @@ class ObjectType:
             ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_IMPLICIT_REF_CAST, \"%s@ f()\", asFUNCTION((refCast%s<%s,%s>)), asCALL_CDECL_OBJLAST);" % (self.name, parent, extra, self.name, parent))
 
         if not "asOBJ_NOCOUNT" in flags:
-            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL);" % (self.name, self.name))
-            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL);" % (self.name, self.name))
+            f = Function(None)
+            f.name = "AddRef"
+            f.clazz = self.name
+            f.const = False
+            t = cindex.Type(cindex.TypeKind.VOID.from_param())
+            f.behaviour = "asBEHAVE_ADDREF"
+            f.return_type = Type(t)
+            behaviours.append(f)
+
+            f = copy.deepcopy(f)
+            f.name = "DelRef"
+            f.behaviour = "asBEHAVE_RELEASE"
+            behaviours.append(f)
         return ret
 
 
