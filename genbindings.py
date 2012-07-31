@@ -23,7 +23,7 @@ import sys
 import re
 import json
 import os.path
-
+import copy
 
 i = 1
 
@@ -217,10 +217,16 @@ class Type:
 def is_reference_type(name):
     if name in config["object_types"] and "reference" in config["object_types"][name]:
         return config["object_types"][name]["reference"]
-    elif name in objecttype_scoreboard:
+    elif name in objecttypes:
+        ot = objecttypes[name]
+        for p in ot.parents:
+            v = is_reference_type(p)
+            if not v is None:
+                return v
+    if name in objecttype_scoreboard:
         score = objecttype_scoreboard[name]
         return score[0] > score[1]
-    return False
+    return None
 
 
 operatornamedict = {
@@ -393,8 +399,13 @@ class Function(object):
         asret = self.return_type.get_as_type()
         call = "%s(" % self.name
         if self.clazz:
-            if self.behaviour == "asBEHAVE_CONSTRUCT" or self.behaviour == "asBEHAVE_FACTORY":
-                call = "new(gen->GetAddressOfReturnLocation()) %s(" %self.name
+            if is_reference_type(self.clazz) and self.behaviour == "asBEHAVE_CONSTRUCT":
+                self.behaviour = "asBEHAVE_FACTORY"
+
+            if self.behaviour == "asBEHAVE_FACTORY":
+                call = "*((%s**)(gen->GetAddressOfReturnLocation())) = new %s(" % (self.name, self.name)
+            elif self.behaviour == "asBEHAVE_CONSTRUCT":
+                call = "new(gen->GetAddressOfReturnLocation()) %s(" % self.name
             else:
                 call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
 
@@ -406,7 +417,10 @@ class Function(object):
             if t in lut:
                 call += "gen->GetArg%s(%d)" % (lut[t], i)
             else:
-                call += "*static_cast<%s*>(gen->GetArgAddress(%d))" % (arg.get_c_type().replace("&", ""), i)
+                ct = arg.get_c_type()
+                pt = "*" in ct
+                star = "*" if not pt else ""
+                call += "%sstatic_cast<%s%s>(gen->GetArgAddress(%d))" % (star, arg.get_c_type().replace("&", ""), star, i)
         call += ")"
         if asret in lut:
             func += "\tgen->SetReturn%s(%s);\n" % (lut[asret], call)
@@ -444,6 +458,7 @@ class Function(object):
                 return _assert("engine->RegisterObjectBehaviour(\"%s\", %s, \"%s\", %s);" % (self.clazz, self.behaviour, name, call))
 
 
+objectindex = 0
 class ObjectType:
     def add_fields(self, children, array):
         for child in children:
@@ -453,10 +468,86 @@ class ObjectType:
                 array.append(child)
 
     def __init__(self, cursor, children, name):
+        global objectindex
         self.cursor = cursor
         self.name = name
         self.flags = {"asOBJ_APP_CLASS": True}
         fields = []
+        self.parents = []
+        self.index = objectindex
+        objectindex += 1
+
+        idx = cindex.CXXAccessSpecifier.PRIVATE if cursor.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
+        access = cindex._cxx_access_specifiers[idx]
+        for child in children:
+
+            if child.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
+                c = child.get_resolved_cursor()
+                parentname = c.spelling
+                self.parents.append(parentname)
+                toadd = []
+                for om in objectmethods:
+                    if om.clazz == parentname:
+                        f = copy.deepcopy(om)
+                        f.clazz = self.name
+                        toadd.append(f)
+                objectmethods.extend(toadd)
+                toadd = []
+                for of in objectfields:
+                    if of.clazz == parentname:
+                        f = copy.deepcopy(of)
+                        f.clazz = self.name
+                        toadd.append(f)
+                objectfields.extend(toadd)
+                continue
+
+            if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
+                access = child.get_cxx_access_specifier()
+                continue
+            if not access.is_public():
+                continue
+
+            elif child.kind == cindex.CursorKind.CXX_METHOD:
+                if child.spelling == "operator=":
+                    self.flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
+                if child.get_cxxmethod_is_static():
+                    # TODO
+                    warn("Skipping member method %s::%s as it's static" % (self.name, child.spelling))
+                    continue
+                try:
+                    objectmethods.append(Function(child, self.name))
+                except Exception as e:
+                    warn("Skipping member method %s::%s - %s" % (self.name, child.spelling, e))
+            elif child.kind == cindex.CursorKind.CONSTRUCTOR:
+                self.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
+                try:
+                    f = Function(child, self.name, "asBEHAVE_CONSTRUCT")
+                    behaviours.append(f)
+                except Exception as e:
+                    warn("Skipping constructor %s::%s - %s" % (self.name, child.spelling, e))
+            elif child.kind == cindex.CursorKind.DESTRUCTOR:
+                self.flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
+                try:
+                    f = Function(child, self.name, "asBEHAVE_DESTRUCT")
+                    behaviours.append(f)
+                except Exception as e:
+                    warn("Skipping destructor %s::%s - %s" % (self.name, child.spelling, e))
+            elif child.kind == cindex.CursorKind.FIELD_DECL:
+                try:
+                    type = Type(child.type)
+                    objectfields.append(ObjectField(self.name, child.spelling, type))
+                except Exception as e:
+                    warn("Skipping member field %s::%s - %s" % (self.name, child.spelling, e))
+            elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
+                name, kind = get_typedef(child)
+                if name:
+                    typedef[name] = kind
+                warn("Typedefs within classes is not supported by AngelScript")
+            else:
+                warn("Unhandled cursor: %s, %s" % (child.displayname, child.kind))
+        if "asOBJ_APP_CLASS_DESTRUCTOR" not in self.flags:
+            self.flags["asOBJ_POD"] = True
+
 
         #self.add_fields(children, fields)
         #if len(fields):
@@ -492,9 +583,14 @@ class ObjectType:
             return _assert("engine->RegisterObjectType(\"%s\", sizeof(%s), %s);" % (self.name, self.name, f))
 
         ret = _assert("engine->RegisterObjectType(\"%s\", 0, %s);" % (self.name, f))
+        for parent in self.parents:
+            extra = "_nocount" if "asOBJ_NOCOUNT" in flags else ""
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_REF_CAST, \"%s@ f()\", asFUNCTION((refCast%s<%s,%s>)), asCALL_CDECL_OBJLAST);" % (parent, self.name, extra,  parent, self.name))
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_IMPLICIT_REF_CAST, \"%s@ f()\", asFUNCTION((refCast%s<%s,%s>)), asCALL_CDECL_OBJLAST);" % (self.name, parent, extra, self.name, parent))
+
         if not "asOBJ_NOCOUNT" in flags:
-            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
-            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL);" % (self.name, self.name))
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL);" % (self.name, self.name))
         return ret
 
 
@@ -613,8 +709,7 @@ def walk(cursor):
             if oir and not oir.search(child.spelling):
                 continue
 
-            idx = cindex.CXXAccessSpecifier.PRIVATE if child.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
-            access = cindex._cxx_access_specifiers[cindex.CXXAccessSpecifier.PRIVATE]
+
             classname = child.spelling
             if len(classname) == 0:
                 classname = child.displayname
@@ -625,52 +720,8 @@ def walk(cursor):
                 # TODO: different namespaces
                 warn("Skipping type %s, as it is already defined" % classname)
 
-            o = ObjectType(cursor, children, classname)
-            for child in children:
-                if child.kind == cindex.CursorKind.CXX_ACCESS_SPEC_DECL:
-                    access = child.get_cxx_access_specifier()
-                    continue
-                if not access.is_public():
-                    continue
-                if child.kind == cindex.CursorKind.CXX_METHOD:
-                    if child.spelling == "operator=":
-                        o.flags["asOBJ_APP_CLASS_ASSIGNMENT"] = True
-                    if child.get_cxxmethod_is_static():
-                        warn("Skipping member method %s::%s as it's static" % (classname, child.spelling))
-                        continue
-                    try:
-                        objectmethods.append(Function(child, classname))
-                    except Exception as e:
-                        warn("Skipping member method %s::%s - %s" % (classname, child.spelling, e))
-                elif child.kind == cindex.CursorKind.CONSTRUCTOR:
-                    o.flags["asOBJ_APP_CLASS_CONSTRUCTOR"] = True
-                    try:
-                        f = Function(child, classname, "asBEHAVE_CONSTRUCT")
-                        behaviours.append(f)
-                    except Exception as e:
-                        warn("Skipping constructor %s::%s - %s" % (classname, child.spelling, e))
-                elif child.kind == cindex.CursorKind.DESTRUCTOR:
-                    o.flags["asOBJ_APP_CLASS_DESTRUCTOR"] = True
-                    try:
-                        f = Function(child, classname, "asBEHAVE_DESTRUCT")
-                        behaviours.append(f)
-                    except Exception as e:
-                        warn("Skipping destructor %s::%s - %s" % (classname, child.spelling, e))
-                elif child.kind == cindex.CursorKind.FIELD_DECL:
-                    try:
-                        type = Type(child.type)
-                        objectfields.append(ObjectField(classname, child.spelling, type))
-                    except Exception as e:
-                        warn("Skipping member field %s::%s - %s" % (classname, child.spelling, e))
-                elif child.kind == cindex.CursorKind.TYPEDEF_DECL:
-                    name, kind = get_typedef(child)
-                    if name:
-                        typedef[name] = kind
-                    warn("Typedefs within classes is not supported by AngelScript")
-                else:
-                    warn("Unhandled cursor: %s, %s" % (child.displayname, child.kind))
-            if "asOBJ_APP_CLASS_DESTRUCTOR" not in o.flags:
-                o.flags["asOBJ_POD"] = True
+            o = ObjectType(child, children, classname)
+
             objecttypes[classname] = o
             add_include(filename)
         elif child.kind == cindex.CursorKind.MACRO_INSTANTIATION or \
@@ -803,10 +854,31 @@ if len(includes):
     f.write("\"\n#include \"".join(includes))
     f.write("\"")
 
-f.write("\n\n")
+f.write("""
+template<class A, class B>
+B* refCast(A* a)
+{
+    if(!a) return NULL;
+
+    B* b = dynamic_cast<B*>(a);
+    if (b != NULL)
+    {
+        b->AddRef();
+    }
+    return b;
+}
+template<class A, class B>
+B* refCast_nocount(A* a)
+{
+    if( !a ) return NULL;
+    return dynamic_cast<B*>(a);
+}
+""")
 
 data  = "void %s(asIScriptEngine* engine)\n{\n\tint r;\n\n\t" % funcname
-data += "\n\t".join([objecttypes[o].get_register_string() for o in objecttypes])
+ot = [objecttypes[o] for o in objecttypes]
+ot.sort(cmp=lambda a, b:  cmp(a.index, b.index))
+data += "\n\t".join([o.get_register_string() for o in ot])
 data += "\n\t"
 data += "\n\t".join(typedefs)
 data += "\n\t"
