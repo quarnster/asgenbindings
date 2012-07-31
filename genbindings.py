@@ -22,6 +22,7 @@ from clang import cindex
 import sys
 import re
 import json
+import os.path
 
 
 i = 1
@@ -36,9 +37,9 @@ config = json.load(f)
 f.close()
 
 
-def get(name, default=None):
-    if name in config:
-        return config[name]
+def get(name, default=None, conf=config):
+    if name in conf:
+        return conf[name]
     else:
         return default
 
@@ -46,10 +47,18 @@ fir = get("file_include_regex", None)
 fer = get("file_exclude_regex", None)
 mir = get("method_include_regex", None)
 mer = get("method_exclude_regex", None)
+oir = get("object_include_regex", None)
+oer = get("object_exclude_regex", None)
+mfir = get("field_include_regex", None)
+mfer = get("field_exclude_regex", None)
 fir = re.compile(fir) if fir else fir
 fer = re.compile(fer) if fer else fer
 mir = re.compile(mir) if mir else mir
 mer = re.compile(mer) if mer else mer
+oir = re.compile(oir) if oir else oir
+oer = re.compile(oer) if oer else oer
+mfir = re.compile(mfir) if mfir else mfir
+mfer = re.compile(mfer) if mfer else mfer
 verbose = get("verbose", False)
 doassert = get("assert", True)
 keep_unknowns = get("keep_unknowns", False)
@@ -59,7 +68,9 @@ generic_wrappers = [] if get("generate_generic_wrappers", False) else None
 
 index = cindex.Index.create()
 
-tu = index.parse(None, get("clang_args", []), [], 13)
+clang_args = get("clang_args", [])
+clang_args.insert(0, "-I%s/clang/include" % os.path.dirname(os.path.abspath(__file__)))
+tu = index.parse(None, clang_args, [], 13)
 
 
 warn_count = 0
@@ -203,6 +214,14 @@ class Type:
         return "%s%s" % ("const " if self.const else "", self.cname)
 
 
+def is_reference_type(name):
+    if name in config["object_types"] and "reference" in config["object_types"][name]:
+        return config["object_types"][name]["reference"]
+    elif name in objecttype_scoreboard:
+        score = objecttype_scoreboard[name]
+        return score[0] > score[1]
+    return False
+
 
 operatornamedict = {
     "-operator":       "opNeg",
@@ -329,22 +348,19 @@ class Function(object):
             if ref:
                 asname2 = get_as_type(a.resolved)[:-1]
                 extra = ""
-                if asname2 in objecttype_scoreboard:
-                    score = objecttype_scoreboard[asname2]
-                    if score[1] >= score[0]:
-                        # Value types can only be in or out references. Defaulting to in
-                        asname += "in"
+
+                if not is_reference_type(asname2):
+                    # Value types can only be in or out references. Defaulting to in
+                    asname += "in"
             asargs.append(asname)
         asargs = ", ".join(asargs)
 
-        if self.behaviour == "asBEHAVE_CONSTRUCT":
+        if self.behaviour == "asBEHAVE_CONSTRUCT" or self.behaviour == "asBEHAVE_FACTORY":
             name = "void f(%s)" % (asargs)
 
-            if self.clazz in objecttype_scoreboard:
-                score = objecttype_scoreboard[self.clazz]
-                if score[0] > score[1]:
-                    name = "%s@ f(%s)" % (self.clazz, asargs)
-                    self.behaviour = "asBEHAVE_FACTORY"
+            if is_reference_type(self.clazz):
+                name = "%s@ %s(%s)" % (self.clazz, self.clazz, asargs)
+                self.behaviour = "asBEHAVE_FACTORY"
         elif self.behaviour == "asBEHAVE_DESTRUCT":
             name = "void f()"
         else:
@@ -377,7 +393,7 @@ class Function(object):
         asret = self.return_type.get_as_type()
         call = "%s(" % self.name
         if self.clazz:
-            if self.behaviour == "asBEHAVE_CONSTRUCT":
+            if self.behaviour == "asBEHAVE_CONSTRUCT" or self.behaviour == "asBEHAVE_FACTORY":
                 call = "new(gen->GetAddressOfReturnLocation()) %s(" %self.name
             else:
                 call = "static_cast<%s*>(gen->GetObject())->%s" % (self.clazz, call)
@@ -463,19 +479,22 @@ class ObjectType:
 
 
     def get_register_string(self):
-        value_type = True
-        if self.name in objecttype_scoreboard:
-            score = objecttype_scoreboard[self.name]
-            value_type = score[0] < score[1]
-        else:
-            warn("No uses of object type \"%s\" found. Guessing %s type." % (self.name, "value" if value_type else "reference"))
-        if value_type:
-            f = "|".join(self.flags)
-            f = "asOBJ_VALUE|%s" % f
+        flags = [] if is_reference_type(self.name) else self.flags
+        if self.name in config["object_types"]:
+            conf = config["object_types"][self.name]
+            if "flags" in conf:
+                flags = conf["flags"]
+            if "extra_flags" in conf:
+                flags.extend(conf["extra_flags"])
+
+        f = "%s%s%s" % ("asOBJ_REF" if is_reference_type(self.name) else "asOBJ_VALUE", "|" if len(flags) else "", "|".join(flags))
+        if not is_reference_type(self.name):
             return _assert("engine->RegisterObjectType(\"%s\", sizeof(%s), %s);" % (self.name, self.name, f))
-        ret = _assert("engine->RegisterObjectType(\"%s\", 0, asOBJ_REF);" % (self.name)) + \
-        "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name)) + \
-        "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
+
+        ret = _assert("engine->RegisterObjectType(\"%s\", 0, %s);" % (self.name, f))
+        if not "asOBJ_NOCOUNT" in flags:
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_ADDREF,  \"void f()\", asMETHOD(%s,AddRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
+            ret += "\n\t" + _assert("engine->RegisterObjectBehaviour(\"%s\", asBEHAVE_RELEASE, \"void f()\", asMETHOD(%s,DelRef), asCALL_THISCALL); assert( r >= 0 );" % (self.name, self.name))
         return ret
 
 
@@ -486,6 +505,11 @@ class ObjectField:
         self.clazz = clazz
         self.name = name
         self.type = type
+        pn = self.pretty_name()
+        if mfer and mfer.search(pn):
+            raise Exception("Matches exclude pattern")
+        if mfir and not mfir.search(pn):
+            raise Exception("Doesn't match include pattern")
 
     def uses(self, typename):
         return self.type.resolved == typename
@@ -584,6 +608,11 @@ def walk(cursor):
             if len(children) == 0:
                 continue
 
+            if oer and oer.search(child.spelling):
+                continue
+            if oir and not oir.search(child.spelling):
+                continue
+
             idx = cindex.CXXAccessSpecifier.PRIVATE if child.kind == cindex.CursorKind.CLASS_DECL else cindex.CXXAccessSpecifier.PUBLIC
             access = cindex._cxx_access_specifiers[cindex.CXXAccessSpecifier.PRIVATE]
             classname = child.spelling
@@ -671,11 +700,12 @@ def remove_ref_val_mismatches():
     global objectmethods
     global behaviours
     for key in objecttype_scoreboard:
+        isref = is_reference_type(key)
         ref, val = objecttype_scoreboard[key]
-        if ref == 0 or val == 0:
+        if (isref and val == 0) or (not isref and ref == 0):
             continue
         warn("\"%s\" is used both as a reference type (%d) and a value type (%d). The following will be removed:" % (key, ref, val))
-        toremove = "%s%s" % (key, "*" if val > ref else "")
+        toremove = "%s%s" % (key, "*" if not isref else "")
 
         functions = mismatch_filter(functions, toremove)
         objectmethods = mismatch_filter(objectmethods, toremove)
@@ -740,6 +770,18 @@ def remove_duplicates():
     objectmethods = dup_filter(objectmethods)
     behaviours = dup_filter(behaviours)
 
+
+def remove_reference_destructors():
+    global behaviours
+    toadd = behaviours
+    behaviours = []
+    while len(toadd):
+        curr = toadd.pop(0)
+        if is_reference_type(curr.clazz) and curr.behaviour == "asBEHAVE_DESTRUCT":
+            warn("Removing destructor for reference type %s" % curr.clazz)
+        else:
+            behaviours.append(curr)
+
 walk(tu.cursor)
 
 # File processed, do some post processing
@@ -748,6 +790,7 @@ remove_ref_val_mismatches()
 if not keep_unknowns:
     remove_unknowns()
 remove_duplicates()
+remove_reference_destructors()
 
 
 f = sys.stdout
