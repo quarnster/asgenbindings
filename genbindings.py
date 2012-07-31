@@ -455,7 +455,8 @@ class Function(object):
                 #func += "\t" + self.return_type.get_c_type() + " ret = %s;\n" % call
                 #func += "\tnew(gen->GetAddressOfReturnLocation()) %s(ret);\n" % self.return_type.get_c_type().replace("&", "")
         func += "}\n"
-        generic_wrappers.append(func)
+        if func not in generic_wrappers:
+            generic_wrappers.append(func)
 
         return "asFUNCTION(%s), asCALL_GENERIC" % (name)
 
