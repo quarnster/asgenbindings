@@ -36,6 +36,11 @@ f = open(sys.argv[1])
 config = json.load(f)
 f.close()
 
+if "object_types" in config:
+    arr = config["object_types"]
+    config["object_types"] = {}
+    for name in arr:
+        config["object_types"][re.compile(name)] = arr[name]
 
 def get(name, default=None, conf=config):
     if name in conf:
@@ -220,9 +225,11 @@ class Type:
 
 
 def is_reference_type(name):
-    if name in config["object_types"] and "reference" in config["object_types"][name]:
-        return config["object_types"][name]["reference"]
-    elif name in objecttypes:
+    if "object_types" in config:
+        for regex in config["object_types"]:
+            if regex.search(name) and "reference" in config["object_types"][regex]:
+                return config["object_types"][regex]["reference"]
+    if name in objecttypes:
         ot = objecttypes[name]
         for p in ot.parents:
             v = is_reference_type(p)
@@ -619,13 +626,19 @@ class ObjectType:
 
 
     def get_register_string(self):
-        flags = [] if is_reference_type(self.name) else self.flags
-        if self.name in config["object_types"]:
-            conf = config["object_types"][self.name]
-            if "flags" in conf:
-                flags = conf["flags"]
-            if "extra_flags" in conf:
-                flags.extend(conf["extra_flags"])
+        flags = [] if is_reference_type(self.name) else list(self.flags)
+        if "object_types" in config:
+            for regex in config["object_types"]:
+                if regex.search(self.name):
+                    conf = config["object_types"][regex]
+                    if "flags" in conf:
+                        flags = conf["flags"]
+                    if "extra_flags" in conf:
+                        flags.extend(conf["extra_flags"])
+
+        if not is_reference_type(self.name):
+            if "asOBJ_NOCOUNT" in flags:
+                flags.remove("asOBJ_NOCOUNT")
 
         f = "%s%s%s" % ("asOBJ_REF" if is_reference_type(self.name) else "asOBJ_VALUE", "|" if len(flags) else "", "|".join(flags))
         if not is_reference_type(self.name):
@@ -666,6 +679,7 @@ class ObjectField:
             raise Exception("Matches exclude pattern")
         if mfir and not mfir.search(pn):
             raise Exception("Doesn't match include pattern")
+
 
     def uses(self, typename):
         return self.type.resolved == typename
@@ -735,6 +749,7 @@ def walk(cursor):
             continue
         if fir and not fir.search(filename):
             continue
+
         if child.kind == cindex.CursorKind.MACRO_DEFINITION:
             tokens = cindex.tokenize(tu, child.extent)
             if tokens[0].kind == cindex.TokenKind.IDENTIFIER and tokens[1].kind == cindex.TokenKind.LITERAL and is_int(tokens[1].spelling):
@@ -768,7 +783,6 @@ def walk(cursor):
                 continue
             if oir and not oir.search(child.spelling):
                 continue
-
 
             classname = child.spelling
             if len(classname) == 0:
