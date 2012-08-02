@@ -27,7 +27,7 @@ import copy
 
 i = 1
 
-if len(sys.argv) != 2:
+if len(sys.argv) < 2:
     print "usage: %s configfile.json"
     sys.exit(1)
 
@@ -74,6 +74,12 @@ keep_unknowns = get("keep_unknowns", False)
 output_filename = get("output_filename", None)
 funcname = get("function_name", "RegisterMyTypes")
 
+for arg in sys.argv[2:]:
+    if arg == "-v":
+        verbose = True
+    elif arg == "-noassert":
+        doassert = False
+
 generic_wrappers = []
 
 index = cindex.Index.create()
@@ -88,7 +94,7 @@ def warn(msg):
     global warn_count
     warn_count += 1
     if verbose:
-        sys.stderr.write(msg + "\n")
+        print msg
 
 def get_type(type, cursor=None):
     pointer = type.kind == cindex.TypeKind.POINTER
@@ -97,7 +103,11 @@ def get_type(type, cursor=None):
     if type.kind == cindex.TypeKind.TYPEDEF or type.kind == cindex.TypeKind.RECORD or type.kind == cindex.TypeKind.ENUM:
         typename = type.get_declaration()
     elif pointer or ref:
-        typename = type.get_pointee().get_declaration()
+        t2 = type.get_pointee()
+        typename = t2.get_declaration()
+
+        if typename is None or typename.kind.is_invalid():
+            typename = get_type(t2)
     elif type.kind == cindex.TypeKind.ULONG:
         typename = "unsigned long"
     elif type.kind == cindex.TypeKind.UINT:
@@ -112,10 +122,10 @@ def get_type(type, cursor=None):
     else:
         typename = type.kind.name.lower()
     if typename is None:
-        raise Exception("Typename was None")
+        raise Exception("Typename was None %s" % type.kind)
     elif isinstance(typename, cindex.Cursor):
         if typename.spelling == None:
-            raise Exception("Typename was None")
+            raise Exception("Typename was None %s" % type.kind)
 
         fullname = [typename.spelling]
         cursor = typename.get_lexical_parent()
@@ -218,7 +228,29 @@ class Type:
         return self.cname
 
     def get_as_type(self):
-        return "%s%s" % ("const " if self.const else "", get_as_type(self.resolved))
+        as_type = None
+        if "object_types" in config:
+            for regex in config["object_types"]:
+                if regex.search(self.cname) != None:
+                    conf = config["object_types"][regex]
+                    if "as_type" in conf:
+                        as_type = regex.sub(conf["as_type"], self.cname)
+                    break
+        if as_type == None:
+            as_type = get_as_type(self.resolved)
+        return "%s%s" % ("const " if self.const else "", as_type)
+
+    def is_known(self):
+        name = self.resolved.replace("*", "").replace("&", "")
+        if name in objecttypes:
+            return True
+        if name in as_builtins:
+            return True
+        if "object_types" in config:
+            for regex in config["object_types"]:
+                if regex.search(self.cname) != None:
+                    return True
+        return False
 
     def get_c_type(self):
         return "%s%s" % ("const " if self.const else "", self.cname)
@@ -408,7 +440,7 @@ class Function(object):
             name = operatornamedict[name]
         name = name.replace("~", "tilde") + "_generic"
         for arg in self.args:
-            name += "_" + arg.get_c_type().replace("&", "amp").replace("*", "star").replace(" ", "space")
+            name += "_" + arg.get_c_type().replace("&", "amp").replace("*", "star").replace(" ", "space").replace(":", "colon")
         if self.clazz:
             name = self.clazz + "_" + name
         func = "void %s(asIScriptGeneric *gen)\n{\n" % name
@@ -436,7 +468,10 @@ class Function(object):
                 ct = arg.get_c_type()
                 pt = "*" in ct
                 star = "*" if not pt else ""
-                call += "%sstatic_cast<%s%s>(gen->GetArgAddress(%d))" % (star, arg.get_c_type().replace("&", ""), star, i)
+                if "&" in ct:
+                    call += "%sstatic_cast<%s%s>(gen->GetArgAddress(%d))" % (star, arg.get_c_type().replace("&", ""), star, i)
+                else:
+                    call += "%sstatic_cast<%s%s>(gen->GetArgObject(%d))" % (star, arg.get_c_type(), star, i)
         call += ")"
         if self.behaviour == "asBEHAVE_FACTORY":
             call += ")"
@@ -837,9 +872,7 @@ def remove_ref_val_mismatches():
         behaviours = mismatch_filter(behaviours, toremove)
 
 
-def is_known(name):
-    name = name.replace("*", "").replace("&", "")
-    return name in objecttypes or name in as_builtins
+
 
 def unknown_filter(source):
     toadd = source
@@ -849,10 +882,10 @@ def unknown_filter(source):
         curr = toadd.pop(0)
         broken = None
         for t in curr.args:
-            if not is_known(t.resolved):
+            if not t.is_known():
                 broken = t.resolved
                 keep = False
-        if not is_known(curr.return_type.resolved):
+        if not curr.return_type.is_known():
             broken = curr.return_type.resolved
             keep = False
         if not keep:
