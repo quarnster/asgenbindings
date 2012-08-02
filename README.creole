@@ -1,5 +1,9 @@
 === Description ===
-A python script using libclang to generate the code needed for exposing your C/C++ code to AngelScript. The libclang binaries are compiled from vanilla 3.1 sources, whereas the cindex.py comes from https://github.com/quarnster/SublimeClang/blob/master/clang/cindex.py.
+A python script using libclang to generate the code needed for exposing your C/C++ code to AngelScript. The libclang binaries are compiled from vanilla 3.1 sources, whereas the cindex.py comes from https://github.com/quarnster/SublimeClang/blob/master/clang/cindex.py. Usage: tweak the sampleconfig.json to fit your own project (you might use a couple of different ones to take care of different bits) and run
+
+{{{
+  python genbindings.py path/to/config.json
+}}}
 
 === License ===
 Like AngelScript itself, this plugin is using the zlib license

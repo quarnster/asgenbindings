@@ -1,0 +1,83 @@
+{
+    // Any arguments provided to the clang compiler.
+    // Typically any include paths needed and the file
+    // that should be compiled and then processed
+    "clang_args":
+    [
+        "-I/include/path/1/",
+        "-I/include/path/2/",
+        "-x",
+        "c++",
+        "/path/to/you/projects/main.cpp"
+    ],
+
+    // Anything defined in a file for which the filename matches the regular expression will be discarded
+    "file_exclude_regex": "(/usr/include|raytrace|Scripting)",
+
+    // Anything defined in a file for which the filename does not match the regular expression will be discarded
+    "file_include_regex": "(mango|btVector|btQuat|btMat|btTrans)",
+
+    // Any method/function matching the regular expression will be discarded
+    "method_exclude_regex": "erialize|(btVec.*setValue)",
+
+    // Any method/function not matching the regular expression will be discarded
+    "method_exclude_regex": ".*",
+
+    // Any object name matching the regular expression will be discarded
+    "object_exclude_regex": "JSON|Buffer|Call|Stack|Profiler|Exception",
+
+    // Any object name not matching the regular expression will be discarded
+    "object_include_regex": ".*",
+
+    // Any fields matching the regular expression will be discarded
+    "field_exclude_regex": "EngineSettings",
+
+    // And field not matching the regular expression will be discarded
+    "field_include_regex": ".*",
+
+    // Any function matching the regular expression will have a
+    // generic call wrapper generated for it
+    "generic_wrapper_regex": ".*",
+
+    // The filename that the output will be written to
+    "output_filename": "scriptregistration.cpp",
+
+    // A dictionary containing regular expressions. Each class and struct name that
+    // clang finds will be matched agains the regular expression and the options
+    // applied
+    "object_types":
+    {
+        "^bt.*":
+        {
+            // Whether the type is a reference type or not
+            "reference": true,
+
+            // Any flags set here will override any of the automatically
+            // generated flags
+            "flags": ["asOBJ_NOCOUNT"],
+
+            // Any flags set here will be added to the flags
+            "extra_flags": ["asOBJ_NOCOUNT"]
+        },
+        "MarchingCubes|EnergyFunction|Engine|MetaSphere":
+        {
+            "reference": true,
+            "flags": ["asOBJ_NOCOUNT"]
+        },
+        "IReferenceCounted":
+        {
+            "reference": true
+        },
+        ".*std::string(.*)":
+        {
+            // Override the type name as used from an AngelScript script.
+            "as_type": "string\\1"
+        }
+    },
+
+    // Whether to be verbose or not. Can also be provided as the commandline option "-v"
+    "verbose": false,
+
+    // Whether or not to wrap all the registration calls in asserts
+    "assert": true
+}

@@ -33,7 +33,9 @@ if len(sys.argv) < 2:
 
 
 f = open(sys.argv[1])
-config = json.load(f)
+data = f.read()
+data = re.sub(r"//[^\n]*\n", "\n", data)
+config = json.loads(data)
 f.close()
 
 if "object_types" in config:
