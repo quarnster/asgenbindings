@@ -432,7 +432,13 @@ class Function(object):
             name = "void f(%s)" % (asargs)
 
             if is_reference_type(self.clazz):
-                name = "%s@ %s(%s)" % (self.clazz, self.clazz, asargs)
+                add = auto_handle_return
+                if self.clazz in objecttypes:
+                    ot = objecttypes[self.clazz]
+                    if "asOBJ_NOCOUNT" in ot.get_flags():
+                        add = False
+
+                name = "%s@%s %s(%s)" % (self.clazz, "+" if add else "", self.clazz, asargs)
                 self.behaviour = "asBEHAVE_FACTORY"
         elif self.behaviour == "asBEHAVE_DESTRUCT":
             name = "void f()"
@@ -482,7 +488,7 @@ class Function(object):
                 self.behaviour = "asBEHAVE_FACTORY"
 
             if self.behaviour == "asBEHAVE_FACTORY":
-                call = "gen->SetReturnObject(new %s(" % (self.name)
+                call = "gen->SetReturnAddress(new %s(" % (self.name)
             elif self.behaviour == "asBEHAVE_CONSTRUCT":
                 call = "new(gen->GetObject()) %s(" % self.name
             else:
@@ -517,7 +523,7 @@ class Function(object):
             pt = "*" in ct
             star = "*" if not pt else ""
             if pt:
-                func += "\tgen->SetReturnObject(%s);\n" % (call)
+                func += "\tgen->SetReturnAddress(%s);\n" % (call)
             elif "&" in ct:
                 func += "\tgen->SetReturnAddress((void*)&%s);\n" % (call)
             else:
