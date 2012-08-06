@@ -23,6 +23,17 @@
     // Any method/function not matching the regular expression will be discarded
     "method_exclude_regex": ".*",
 
+    // Any method/function matching the regular expression will be defined with
+    // auto handles (@+) for any object handle arguments. See
+    // http://angelcode.com/angelscript/sdk/docs/manual/doc_obj_handle.html
+    "method_argument_auto_handle_regex": ".*",
+
+    // Any method/function matching the regular expression will be defined with
+    // auto handles (@+) for object handle returns. See
+    // http://angelcode.com/angelscript/sdk/docs/manual/doc_obj_handle.html
+    "method_return_auto_handle_regex": "",
+
+
     // Any object name matching the regular expression will be discarded
     "object_exclude_regex": "JSON|Buffer|Call|Stack|Profiler|Exception",
 

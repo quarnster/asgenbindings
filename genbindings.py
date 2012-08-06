@@ -25,7 +25,6 @@ import json
 import os.path
 import copy
 
-i = 1
 
 if len(sys.argv) < 2:
     print "usage: %s configfile.json"
@@ -59,6 +58,8 @@ oer = get("object_exclude_regex", None)
 mfir = get("field_include_regex", None)
 mfer = get("field_exclude_regex", None)
 generic_regex = get("generic_wrapper_regex", None)
+maahr = get("method_argument_auto_handle_regex", None)
+mrahr = get("method_return_auto_handle_regex", None)
 
 fir = re.compile(fir) if fir else fir
 fer = re.compile(fer) if fer else fer
@@ -68,6 +69,8 @@ oir = re.compile(oir) if oir else oir
 oer = re.compile(oer) if oer else oer
 mfir = re.compile(mfir) if mfir else mfir
 mfer = re.compile(mfer) if mfer else mfer
+maahr = re.compile(maahr) if maahr else maahr
+mrahr = re.compile(mrahr) if mrahr else mrahr
 generic_regex = re.compile(generic_regex) if generic_regex else generic_regex
 
 verbose = get("verbose", False)
@@ -390,13 +393,19 @@ class Function(object):
             return "%s %s(%s)" % (self.return_type, self.name, cargs)
 
     def asname(self):
-
         name = self.name
         if "operator" in name:
             if name not in operatornamedict:
                 raise Exception("Operator not supported in AngelScript %s" % self.pretty_name())
             name = operatornamedict[name]
         asargs = []
+        auto_handle_args = False
+        auto_handle_return = False
+        if maahr and maahr.search(self.pretty_name()) != None:
+            auto_handle_args = True
+        if mrahr and mrahr.search(self.pretty_name()) != None:
+            auto_handle_return = True
+
         for a in self.args:
             asname = a.get_as_type()
             ref = "&" in asname
@@ -407,6 +416,15 @@ class Function(object):
                 if not is_reference_type(asname2):
                     # Value types can only be in or out references. Defaulting to in
                     asname += "in"
+            if "@" in asname and auto_handle_args:
+                asname2 = asname[:-1]
+                add = True
+                if asname2 in objecttypes:
+                    ot = objecttypes[asname2]
+                    if "asOBJ_NOCOUNT" in ot.get_flags():
+                        add = False
+                if add:
+                    asname += "+"
             asargs.append(asname)
         asargs = ", ".join(asargs)
 
@@ -419,7 +437,18 @@ class Function(object):
         elif self.behaviour == "asBEHAVE_DESTRUCT":
             name = "void f()"
         else:
-            name = "%s %s(%s)" % (self.return_type.get_as_type(), name, asargs)
+            asname = self.return_type.get_as_type()
+            if "@" in asname and auto_handle_return:
+                asname2 = asname[:-1]
+                add = True
+                if asname2 in objecttypes:
+                    ot = objecttypes[asname2]
+                    if "asOBJ_NOCOUNT" in ot.get_flags():
+                        add = False
+                if add:
+                    asname += "+"
+
+            name = "%s %s(%s)" % (asname, name, asargs)
         if self.clazz and self.const:
             name += " const"
 
@@ -642,27 +671,28 @@ class ObjectType:
             self.flags["asOBJ_POD"] = True
 
 
-        #self.add_fields(children, fields)
-        #if len(fields):
-        #    try:
-        #        child = fields.pop(0)
-        #        t = get_real_type(get_type(child.type, child))
-        #        allEqual = True
-        #        for field in fields:
-        #            t2 = get_real_type(get_type(field.type, field))
-        #            if t2 != t:
-        #                break
-        #        if allEqual:
-        #            if t == "float":
-        #                self.flags["asOBJ_APP_CLASS_ALLFLOATS"] = True
-        #            elif t == "int" or t == "unsigned int":
-        #                self.flags["asOBJ_APP_CLASS_ALLINTS"] = True
-        #            print "%s has all fields of equal type: %s" % (self.name, t)
-        #    except:
-        #        pass
+        self.add_fields(children, fields)
+        if len(fields):
+            try:
+                child = fields.pop(0)
+                t = get_real_type(get_type(child.type, child))
+                allEqual = True
+                for field in fields:
+                    t2 = get_real_type(get_type(field.type, field))
+                    if t2 != t:
+                        break
+                if allEqual:
+                    if t == "float":
+                        self.flags["asOBJ_APP_CLASS_ALLFLOATS"] = True
+                    elif t == "int" or t == "unsigned int":
+                        self.flags["asOBJ_APP_CLASS_ALLINTS"] = True
+                else:
+                    warn("%s does not have all fields of equal type. Trying ALLINTS anyway" % (self.name, t))
+                    self.flags["asOBJ_APP_CLASS_ALLINTS"] = True
+            except:
+                pass
 
-
-    def get_register_string(self):
+    def get_flags(self):
         flags = [] if is_reference_type(self.name) else list(self.flags)
         if "object_types" in config:
             for regex in config["object_types"]:
@@ -676,6 +706,11 @@ class ObjectType:
         if not is_reference_type(self.name):
             if "asOBJ_NOCOUNT" in flags:
                 flags.remove("asOBJ_NOCOUNT")
+
+        return flags
+
+    def get_register_string(self):
+        flags = self.get_flags()
 
         f = "%s%s%s" % ("asOBJ_REF" if is_reference_type(self.name) else "asOBJ_VALUE", "|" if len(flags) else "", "|".join(flags))
         if not is_reference_type(self.name):
