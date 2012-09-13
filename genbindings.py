@@ -610,6 +610,9 @@ class ObjectType:
             if child.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
                 c = child.get_resolved_cursor()
                 parentname = c.spelling
+                if parentname in objecttypes:
+                    ot = objecttypes[parentname]
+                    self.parents.extend(ot.parents)
                 self.parents.append(parentname)
                 toadd = []
                 for om in objectmethods:
