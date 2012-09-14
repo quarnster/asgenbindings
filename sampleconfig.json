@@ -50,8 +50,9 @@
     // generic call wrapper generated for it
     "generic_wrapper_regex": ".*",
 
-    // The filename that the output will be written to
-    "output_filename": "scriptregistration.cpp",
+    // The filename that the output will be written to.
+    // ${this_file_path} will be replaced by the path to this configuration file.
+    "output_filename": "${this_file_path}/scriptregistration.cpp",
 
     // A dictionary containing regular expressions. Each class and struct name that
     // clang finds will be matched agains the regular expression and the options

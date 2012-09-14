@@ -91,6 +91,10 @@ index = cindex.Index.create()
 
 clang_args = get("clang_args", [])
 clang_args.insert(0, "-I%s/clang/include" % os.path.dirname(os.path.abspath(__file__)))
+new_args = []
+for arg in clang_args:
+    new_args.append(arg.replace("${this_file_path}", os.path.dirname(os.path.abspath(sys.argv[1]))))
+clang_args = new_args
 tu = index.parse(None, clang_args, [], 13)
 
 
@@ -99,7 +103,7 @@ def warn(msg):
     global warn_count
     warn_count += 1
     if verbose:
-        print msg
+        sys.stderr.write(msg + "\n")
 
 def get_type(type, cursor=None):
     pointer = type.kind == cindex.TypeKind.POINTER
@@ -834,7 +838,9 @@ def walk(cursor):
         if child.kind == cindex.CursorKind.MACRO_DEFINITION:
             tokens = cindex.tokenize(tu, child.extent)
             if tokens[0].kind == cindex.TokenKind.IDENTIFIER and tokens[1].kind == cindex.TokenKind.LITERAL and is_int(tokens[1].spelling):
-                enums.append(_assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling)))
+                define = _assert("engine->RegisterEnumValue(\"HASH_DEFINES\", \"%s\", %s);" % (tokens[0].spelling, tokens[1].spelling))
+                if define not in enums:
+                    enums.append(define)
         elif child.kind == cindex.CursorKind.FUNCTION_DECL:
             try:
                 f = Function(child)
@@ -1016,6 +1022,7 @@ remove_pure_virtual_constructors()
 
 f = sys.stdout
 if output_filename != None:
+    output_filename = output_filename.replace("${this_file_path}", os.path.dirname(os.path.abspath(sys.argv[1])))
     f = open(output_filename, "w")
 f.write("#include <angelscript.h>\n#include <assert.h>\n\n")
 
@@ -1052,6 +1059,7 @@ data += "\n\t".join([o.get_register_string() for o in ot])
 data += "\n\t"
 data += "\n\t".join(typedefs)
 data += "\n\t"
+data += "\n\t%s" % _assert("engine->RegisterEnum(\"HASH_DEFINES\");")
 data += "\n\t".join(enums)
 data += "\n\t"
 data += "\n\t".join([o.get_register_string() for o in functions])
